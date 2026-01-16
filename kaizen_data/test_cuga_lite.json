@@ -1,0 +1,63 @@
+{
+  "id": "test_cuga_lite",
+  "created_at": "2026-01-16T16:43:13.387997+00:00",
+  "entities": [
+    {
+      "id": "1",
+      "type": "trajectory",
+      "content": "Calculate sum of numbers",
+      "created_at": "2026-01-16T17:05:49.424424+00:00",
+      "metadata": {
+        "task_id": "test_task_001",
+        "role": "user",
+        "message": {
+          "role": "user",
+          "content": "Calculate sum of numbers"
+        }
+      }
+    },
+    {
+      "id": "2",
+      "type": "trajectory",
+      "content": "I'll calculate the sum",
+      "created_at": "2026-01-16T17:05:49.424424+00:00",
+      "metadata": {
+        "task_id": "test_task_001",
+        "role": "assistant",
+        "message": {
+          "role": "assistant",
+          "content": "I'll calculate the sum"
+        }
+      }
+    },
+    {
+      "id": "3",
+      "type": "trajectory",
+      "content": "```python\nresult = sum([1, 2, 3])\n```",
+      "created_at": "2026-01-16T17:05:49.424424+00:00",
+      "metadata": {
+        "task_id": "test_task_001",
+        "role": "assistant",
+        "message": {
+          "role": "assistant",
+          "content": "```python\nresult = sum([1, 2, 3])\n```"
+        }
+      }
+    },
+    {
+      "id": "4",
+      "type": "trajectory",
+      "content": "Execution output: 6",
+      "created_at": "2026-01-16T17:05:49.424424+00:00",
+      "metadata": {
+        "task_id": "test_task_001",
+        "role": "system",
+        "message": {
+          "role": "system",
+          "content": "Execution output: 6"
+        }
+      }
+    }
+  ],
+  "next_id": 5
+}

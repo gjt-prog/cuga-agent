@@ -46,6 +46,17 @@ sub_task_keep_last_n = 5  # Number of most recent generated variables to keep wh
 code_executor_keep_last_n = -1  # Number of variables to keep after code execution: -1 = keep all, 1 = keep last 1, 2 = keep last 2, etc.
 cuga_lite_max_steps = 25  # Maximum number of steps (call_model + sandbox cycles) before returning error
 
+[kaizen]
+enabled = true  # Enable Kaizen self-improving capabilities
+kaizen_path = "~/Dev/oss/kaizen"  # Path to Kaizen installation
+namespace_id = "cuga_lite"  # Namespace for storing guidelines and trajectories
+provider = "filesystem"  # Backend provider: 'filesystem' or 'milvus'
+retrieve_guidelines = true  # Retrieve guidelines before task execution
+save_trajectories = true  # Save successful trajectories for learning
+generate_tips = true  # Generate tips from trajectories
+guideline_limit = 5  # Maximum number of guidelines to retrieve per task
+min_trajectory_length = 3  # Minimum trajectory length to save (number of messages)
+
 
 [policy]
 enabled = true  # Enable policy system (intent guards, playbooks, tool guides, tool approvals)
