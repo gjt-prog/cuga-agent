@@ -39,6 +39,10 @@ dependencies = [
 
 [project.optional-dependencies]
 evaluation = ["rapidfuzz"]
+phoenix = [
+    "arize-phoenix>=5.0.0",
+    "openinference-instrumentation-langchain>=0.1.0",
+]
 
 
 [project.urls]

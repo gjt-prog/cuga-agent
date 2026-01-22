@@ -56,6 +56,15 @@ save_trajectories = true  # Save successful trajectories for learning
 generate_tips = true  # Generate tips from trajectories
 guideline_limit = 5  # Maximum number of guidelines to retrieve per task
 min_trajectory_length = 3  # Minimum trajectory length to save (number of messages)
+[phoenix]
+enabled = false  # Enable Phoenix (Arize) observability
+project_name = "cuga-agent"  # Phoenix project name
+phoenix_host = "http://localhost"  # Phoenix server host
+phoenix_port = 6006  # Phoenix server port
+auto_instrument_langchain = true  # Automatically instrument LangChain calls
+launch_phoenix = false  # Launch Phoenix server locally (set to true for local development)
+# phoenix_collector_endpoint = ""  # Optional: Custom collector endpoint (overrides host/port)
+
 
 
 [policy]
