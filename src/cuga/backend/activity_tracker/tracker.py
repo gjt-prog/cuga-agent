@@ -822,7 +822,102 @@ class ActivityTracker(object):
                 indent=4,
             )
 
+        # Save to Kaizen if enabled
+        self._save_to_kaizen()
+
+
+    def _save_to_kaizen(self) -> bool:
+        """
+        Save current trajectory to Kaizen knowledge base.
+
+        Converts ActivityTracker steps to OpenAI message format and calls
+        Kaizen's save_trajectory tool via MCP.
+
+        Returns:
+            bool: True if saved successfully, False otherwise
+        """
+        # Check if Kaizen integration is enabled
+        if not settings.kaizen.enabled or not settings.kaizen.save_trajectories:
+            return False
+
+        # Check minimum trajectory length (count messages, not steps)
+        total_messages = sum(len(step.prompts) for step in self.steps)
+        if total_messages < settings.kaizen.min_trajectory_length:
+            logger.debug(
+                f"Trajectory too short for Kaizen ({total_messages} messages < "
+                f"{settings.kaizen.min_trajectory_length})"
+            )
+            return False
+
+        try:
+            # Convert steps to OpenAI message format
+            messages = self._convert_steps_to_openai_messages()
+
+            if not messages:
+                logger.debug("No messages to save to Kaizen")
+                return False
+
+            # Call Kaizen save_trajectory tool via MCP
+            if "kaizen" in self.tools:
+                result = self.invoke_tool_sync(
+                    server_name="kaizen",
+                    tool_name="save_trajectory",
+                    args={
+                        "messages": messages,
+                        "namespace_id": settings.kaizen.namespace_id,
+                        "task_id": self.task_id,
+                        "generate_tips": settings.kaizen.generate_tips,
+                    },
+                )
+
+                if result.get("success"):
+                    logger.info(
+                        f"✨ Kaizen: Saved trajectory {result.get('task_id')} "
+                        f"({result.get('messages_saved')} messages, "
+                        f"{result.get('tips_generated', 0)} tips generated)"
+                    )
+                    return True
+                else:
+                    logger.warning(f"Kaizen: Failed to save trajectory - {result.get('error')}")
+                    return False
+            else:
+                logger.debug("Kaizen tools not available (MCP server not configured)")
+                return False
+
+        except Exception as e:
+            # Never let Kaizen errors break the tracker
+            logger.error(f"Kaizen: Error saving trajectory - {e}")
+            return False
+
+    def _convert_steps_to_openai_messages(self) -> List[Dict[str, Any]]:
+        """
+        Convert ActivityTracker steps to OpenAI message format for Kaizen.
+
+        Extracts prompts from each step and adds context from intent/final_answer.
+
+        Returns:
+            List of message dicts with 'role' and 'content' keys
+        """
+        messages = []
+
+        # Add user intent as first message (if available)
+        if self.intent:
+            messages.append({"role": "user", "content": self.intent})
+
+        # Extract prompts from all steps
+        # Steps already contain prompts in the format we need
+        for step in self.steps:
+            for prompt in step.prompts:
+                messages.append({"role": prompt.role, "content": prompt.value})
+
+        # Add final answer as last message (if available)
+        if self.final_answer:
+            messages.append({"role": "assistant", "content": self.final_answer})
+
+        return messages
+
     def finish_task(
+
         self,
         task_id: str,
         site: str,
