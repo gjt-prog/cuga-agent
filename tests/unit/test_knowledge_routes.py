@@ -57,6 +57,115 @@ async def _identity_override(request: Request) -> KnowledgeIdentity:
     )
 
 
+def test_upload_documents_async_returns_queued_task_when_wait_false():
+    """wait=false short-circuits to a 202-style queued task with weighted_pct=0,
+    so the UI can switch to polling without waiting for ingest to finish."""
+    app = FastAPI()
+    app.include_router(knowledge_router)
+    app.dependency_overrides[require_internal_or_auth] = _identity_override
+    app.state.app_state = SimpleNamespace(
+        knowledge_engine=_FakeEngine({}),
+        knowledge_provider=None,
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/knowledge/documents",
+        files={"files": ("notes.txt", b"hello", "text/plain")},
+        data={"scope": "agent", "replace_duplicates": "true", "wait": "false"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task_id"] == "task-1"
+    assert body["status"] == "pending"
+    assert body["weighted_pct"] == 0.0
+    # ``ui_phase=queued`` lets the UI render a distinct "Queued" indicator
+    # for the gap between accept-the-upload and start-of-ingest.
+    assert body["ui_phase"] == "queued"
+
+
+def test_get_task_attaches_weighted_pct_during_embed():
+    """Polling GET /tasks/{id} must surface a single 0..1 number that
+    monotonically rises across the parse → embed → insert pipeline."""
+    task = {
+        "task_id": "task-1",
+        "collection": "kb_agent_cuga_default",
+        "status": "running",
+        "file_tasks": {
+            "report.pdf": {
+                "filename": "report.pdf",
+                "stage": "embed",
+                "progress": {"done": 100, "total": 400},
+            }
+        },
+    }
+    app = FastAPI()
+    app.include_router(knowledge_router)
+    app.dependency_overrides[require_internal_or_auth] = _identity_override
+    app.state.app_state = SimpleNamespace(
+        knowledge_engine=_FakeEngine(task),
+        knowledge_provider=None,
+    )
+
+    client = TestClient(app)
+    response = client.get(
+        "/api/knowledge/tasks/task-1",
+        headers={"X-Agent-ID": "cuga-default"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    # parse(0.45) + embed(0.40) * 100/400 = 0.55
+    assert body["weighted_pct"] == 0.55
+
+
+def test_list_tasks_agent_scope_spans_inflight_collection():
+    """Reindex-tile live progress: GET /tasks?scope=agent must return tasks
+    for ALL of this agent's collections — the ACTIVE one AND an in-flight
+    reindex target (different config hash, not yet promoted) — while
+    EXCLUDING other agents' and session tasks. Without this, a deferred-flip
+    reindex (reindex_for_config -> new collection) leaves the tile frozen at
+    'Pending' until promotion, because the poll only saw the active hash."""
+
+    active = "kb_agent_cuga_default_aaaa"
+    inflight = "kb_agent_cuga_default_bbbb"
+    every_task = [
+        {"task_id": "t-active", "collection": active, "status": "completed"},
+        {"task_id": "t-inflight", "collection": inflight, "status": "running"},
+        {"task_id": "t-other-agent", "collection": "kb_agent_other_cccc", "status": "running"},
+        {"task_id": "t-session", "collection": "kb_sess_xyz", "status": "running"},
+    ]
+
+    class _TasksEngine:
+        # _config.enabled gates agent scope in resolve_collection.
+        _config = SimpleNamespace(enabled=True)
+
+        async def get_tasks(self, collection=None):
+            if collection is None:
+                return list(every_task)
+            return [t for t in every_task if t["collection"] == collection]
+
+    app = FastAPI()
+    app.include_router(knowledge_router)
+    app.dependency_overrides[require_internal_or_auth] = _identity_override
+    app.state.app_state = SimpleNamespace(
+        knowledge_engine=_TasksEngine(),
+        knowledge_provider=None,
+        knowledge_config_hash="aaaa",
+    )
+
+    client = TestClient(app)
+    resp = client.get(
+        "/api/knowledge/tasks?scope=agent",
+        headers={"X-Agent-ID": "cuga-default"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    ids = {t["task_id"] for t in resp.json()["tasks"]}
+    assert ids == {"t-active", "t-inflight"}, f"agent scope must span active+inflight only: {ids}"
+
+
 def test_upload_documents_returns_400_when_single_file_ingestion_fails():
     task = {
         "task_id": "task-1",

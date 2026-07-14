@@ -47,8 +47,9 @@ from cuga.backend.cuga_graph.nodes.cuga_lite.cuga_lite_node import CugaLiteNode
 from cuga.backend.cuga_graph.nodes.cuga_lite.cuga_lite_graph import (
     create_cuga_lite_graph,
 )
-from cuga.backend.cuga_graph.nodes.cuga_lite.combined_tool_provider import CombinedToolProvider
-from cuga.backend.cuga_graph.nodes.cuga_lite.tool_provider_interface import ToolProviderInterface
+from cuga.backend.cuga_graph.nodes.cuga_lite.providers.combined import CombinedToolProvider
+from cuga.backend.cuga_graph.nodes.cuga_lite.providers.base import ToolProviderInterface
+from cuga.backend.cuga_graph.nodes.cuga_lite.providers.toolguard import ensure_toolguard_provider
 from cuga.backend.cuga_graph.nodes.cuga_supervisor.cuga_supervisor_node import CugaSupervisorNode
 from cuga.backend.cuga_graph.nodes.cuga_supervisor.cuga_supervisor_graph import (
     create_cuga_supervisor_graph,
@@ -173,9 +174,22 @@ class DynamicAgentGraph:
         # Add CugaLite entry node
         graph.add_node(self.cuga_lite.name, self.cuga_lite.node)
 
-        # Create and add CugaLite subgraph
-        # Use provided tool provider or create default CombinedToolProvider
-        tool_provider = self.tool_provider or CombinedToolProvider()
+        # Create and add CugaLite subgraph.
+        # Use provided tool provider or create default CombinedToolProvider,
+        # then wrap it with ToolGuard at the provider boundary.
+        base_provider = self.tool_provider or CombinedToolProvider()
+        policy_storage = (
+            self.policy_system.storage
+            if self.policy_system is not None and hasattr(self.policy_system, "storage")
+            else None
+        )
+        tool_provider = ensure_toolguard_provider(
+            base_provider,
+            policy_storage=policy_storage,
+            cuga_folder=self.cuga_folder,
+            enabled=settings.policy.enabled,
+        )
+        self.tool_provider = tool_provider
         await tool_provider.initialize()
 
         # Get apps for apps_list
@@ -188,11 +202,9 @@ class DynamicAgentGraph:
                 model = create_llm_from_config(self.llm_config)
             except Exception as _llm_err:
                 logger.warning(
-                    "build_graph: failed to create LLM from saved config (provider=%s model=%s): %s — "
-                    "falling back to env/TOML settings",
-                    self.llm_config.get("provider"),
-                    self.llm_config.get("model"),
-                    _llm_err,
+                    f"build_graph: failed to create LLM from saved config "
+                    f"(provider={self.llm_config.get('provider')} model={self.llm_config.get('model')}): "
+                    f"{_llm_err} — falling back to env/TOML settings"
                 )
                 llm_manager = LLMManager()
                 llm_manager._models.clear()
@@ -226,9 +238,8 @@ class DynamicAgentGraph:
                 if getattr(settings.supervisor, "enabled", False):
                     llm_manager = LLMManager()
                 logger.info(
-                    "build_graph: using LLM from config — provider=%s model=%s",
-                    self.llm_config.get("provider"),
-                    self.llm_config.get("model"),
+                    f"build_graph: using LLM from config — "
+                    f"provider={self.llm_config.get('provider')} model={self.llm_config.get('model')}"
                 )
         else:
             llm_manager = LLMManager()

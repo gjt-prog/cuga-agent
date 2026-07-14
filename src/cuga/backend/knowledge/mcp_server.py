@@ -15,6 +15,11 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 
+from cuga.backend.cuga_graph.nodes.cuga_lite.executors.filesystem.paths import (
+    VIRTUAL_WORKSPACE_ROOT,
+    resolve_workspace_path,
+)
+
 logger = logging.getLogger("cuga.knowledge")
 
 # --- Configuration ---
@@ -140,6 +145,40 @@ def _get_agent_id() -> str:
     return "cuga-default"
 
 
+_LEGACY_VIRTUAL_ROOTS = ("/tmp", "/private/tmp")
+
+
+def _is_allowed_virtual_absolute(posix_path: str) -> bool:
+    if posix_path == VIRTUAL_WORKSPACE_ROOT or posix_path.startswith(f"{VIRTUAL_WORKSPACE_ROOT}/"):
+        return True
+    return any(
+        posix_path == legacy or posix_path.startswith(f"{legacy}/") for legacy in _LEGACY_VIRTUAL_ROOTS
+    )
+
+
+def _resolve_ingest_file_path(file_path: str, *, thread_id: str) -> Path:
+    """Resolve and confine ingest paths to the agent workspace (CWE-22/73)."""
+    raw = (file_path or "").strip()
+    if not raw:
+        raise ValueError("file_path is required")
+
+    posix = raw.replace("\\", "/")
+    if posix.startswith("/") and not _is_allowed_virtual_absolute(posix):
+        raise ValueError(
+            "file_path must be under /workspace; "
+            f"absolute paths outside the workspace are not allowed: {file_path!r}"
+        )
+
+    resolved = resolve_workspace_path(
+        raw,
+        thread_id=thread_id or None,
+        operation="ingest_knowledge",
+    )
+    if not resolved.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    return resolved
+
+
 def _identity_headers(agent_id: str = "", thread_id: str = "") -> dict[str, str]:
     """Build identity headers. Uses explicit agent_id if provided, else auto-discovers."""
     aid = agent_id if agent_id else _get_agent_id()
@@ -160,23 +199,56 @@ mcp = FastMCP(
 @mcp.tool()
 async def search_knowledge(
     query: str,
-    scope: str = "agent",
+    scope: str = "all",
     agent_id: str = "",
     thread_id: str = "",
 ) -> dict[str, Any]:
     """Search documents in the knowledge base.
 
-    Use only scopes enabled for the current agent. Disabled scopes will fail.
-    When using scope="session", thread_id is required to identify the conversation.
-    Returns results with text, filename, and page number.
+    Scopes: ``"all"`` (default — both agent + session), ``"agent"``,
+    ``"session"``. See the Knowledge Tool Contract block in your system
+    prompt for query-writing rules, scope-restriction rules, how to read
+    ``by_source`` / ``scope_legend`` / ``partial`` / ``error``, and the
+    iterative-search budget — this docstring is intentionally terse to
+    keep the contract the single source of truth.
     """
-    resp = await _request(
-        "POST",
-        "/api/knowledge/search",
-        headers=_identity_headers(agent_id, thread_id),
-        json={"scope": scope, "query": query},
-    )
-    return resp.json()
+    try:
+        resp = await _request(
+            "POST",
+            "/api/knowledge/search",
+            headers=_identity_headers(agent_id, thread_id),
+            json={"scope": scope, "query": query},
+        )
+        return resp.json()
+    except httpx.HTTPStatusError as e:
+        # Convert HTTP errors into a structured response so the LLM can
+        # decide what to do (retry, fall back, ask the user) instead of
+        # seeing an opaque exception trace. Preserve the backend's detail
+        # string when it's a JSON body, otherwise the raw text.
+        #
+        # We do NOT set ``partial=True`` here: with ``results=[]`` the
+        # call returned nothing usable, and the canonical contract tells
+        # the LLM partial means "at least one scope succeeded — answer
+        # with what you have." Hallucinating from an empty set would be
+        # the worst possible failure mode. The presence of ``error``
+        # alone is the signal to retry or move on.
+        detail: Any
+        try:
+            detail = e.response.json().get("detail", e.response.text)
+        except Exception:
+            detail = e.response.text
+        return {
+            "scope": scope,
+            "results": [],
+            "error": f"HTTP {e.response.status_code}: {detail}",
+        }
+    except httpx.HTTPError as e:
+        # Network-level: DNS, connection refused, timeout. Same contract.
+        return {
+            "scope": scope,
+            "results": [],
+            "error": f"Knowledge service unreachable: {e}",
+        }
 
 
 @mcp.tool()
@@ -192,18 +264,21 @@ async def ingest_knowledge(
     Supports PDF, DOCX, XLSX, PPTX, HTML, Markdown, images (with OCR), and more.
     Use only scopes enabled for the current agent.
     When using scope="session", thread_id is required.
+
+    ``file_path`` must resolve under the agent workspace (``/workspace/...`` or a
+    relative path within it). Host-absolute paths such as ``/etc/passwd`` are rejected.
     """
-    import os
+    try:
+        resolved = _resolve_ingest_file_path(file_path, thread_id=thread_id)
+    except (ValueError, FileNotFoundError) as exc:
+        return {"error": str(exc)}
 
-    if not os.path.exists(file_path):
-        return {"error": f"File not found: {file_path}"}
-
-    with open(file_path, "rb") as f:
+    with open(resolved, "rb") as f:
         resp = await _request(
             "POST",
             "/api/knowledge/documents",
             headers=_identity_headers(agent_id, thread_id),
-            files={"files": (os.path.basename(file_path), f)},
+            files={"files": (resolved.name, f)},
             data={"scope": scope, "replace_duplicates": str(replace_duplicates).lower()},
         )
     return resp.json()

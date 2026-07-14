@@ -91,8 +91,11 @@ class PolicyFilesystemSync:
         # Build frontmatter
         # Get policy type - try 'type' first, then 'policy_type'
         policy_type = getattr(policy, 'type', None) or getattr(policy, 'policy_type', None)
-        policy_type_value = policy_type.value if hasattr(policy_type, 'value') else str(policy_type)
-
+        policy_type_value = (
+            policy_type.value
+            if policy_type is not None and hasattr(policy_type, 'value')
+            else str(policy_type)
+        )
         frontmatter = {
             'id': policy.id,
             'name': policy.name,
@@ -103,10 +106,11 @@ class PolicyFilesystemSync:
         }
 
         # Add triggers if present
-        if hasattr(policy, 'triggers') and policy.triggers:
+        policy_triggers = getattr(policy, 'triggers', None)
+        if policy_triggers:
             triggers_config = {}
 
-            for trigger in policy.triggers:
+            for trigger in policy_triggers:
                 if isinstance(trigger, KeywordTrigger):
                     triggers_config['keywords'] = trigger.value
                     triggers_config['target'] = trigger.target
@@ -134,7 +138,13 @@ class PolicyFilesystemSync:
             if policy.target_apps:
                 frontmatter['target_apps'] = policy.target_apps
             frontmatter['prepend'] = policy.prepend
+            frontmatter['guards_enabled'] = policy.guards_enabled
             content = policy.guide_content or ""
+            if policy.tool_guards:
+                frontmatter['tool_guards'] = {
+                    tool_name: guard.model_dump() if hasattr(guard, "model_dump") else guard
+                    for tool_name, guard in policy.tool_guards.items()
+                }
         elif isinstance(policy, IntentGuard):
             if policy.response:
                 frontmatter['response_type'] = policy.response.response_type
@@ -158,7 +168,7 @@ class PolicyFilesystemSync:
         # Build markdown file
         import yaml
 
-        frontmatter_yaml = yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True)
+        frontmatter_yaml = yaml.safe_dump(frontmatter, default_flow_style=False, allow_unicode=True)
 
         markdown = f"---\n{frontmatter_yaml}---\n\n{content}"
         return markdown

@@ -22,8 +22,8 @@ Building a domain-specific enterprise agent from scratch is complex and requires
 [![Documentation](https://shields.io/badge/Documentation-Available-blue?logo=gitbook&style=for-the-badge)](https://docs.cuga.dev)
 [![Discord](https://shields.io/badge/Discord-Join-blue?logo=discord&style=for-the-badge)](https://discord.gg/aH6rAEEW)
 
-[![AppWorld](https://img.shields.io/badge/%F0%9F%A5%87%20%231%20on-AppWorld-gold?style=for-the-badge)](https://appworld.dev/leaderboard)
-[![WebArena](https://img.shields.io/badge/Top--tier%20on-WebArena-silver?style=for-the-badge)](https://docs.google.com/spreadsheets/d/1M801lEpBbKSNwP-vDBkC_pF7LdyGU1f_ufZb_NWNBZQ/edit?gid=0#gid=0)
+[![AppWorld](https://img.shields.io/badge/%F0%9F%A5%87%20%231%20(07%2F25-02%2F26)%20on-AppWorld-gold?style=for-the-badge)](https://appworld.dev/leaderboard)
+[![WebArena](https://img.shields.io/badge/%F0%9F%A5%87%20%231%20(02%2F25-09%2F25)%20on-WebArena-gold?style=for-the-badge)](https://docs.google.com/spreadsheets/d/1M801lEpBbKSNwP-vDBkC_pF7LdyGU1f_ufZb_NWNBZQ/edit?gid=0#gid=0)
 
 </div>
 
@@ -42,8 +42,8 @@ Building a domain-specific enterprise agent from scratch is complex and requires
 > | **Manage & publish** | `cuga start manager` · draft tools, MCP, LLM, and policies in the web UI, then **publish** a versioned config for production chat ([details](#manage-publish-and-self-hosting)) |
 > | **Reflection** | `[advanced_features] reflection_enabled` in [`settings.toml`](src/cuga/settings.toml) |
 > | **Langflow** | Low-code visual workflows — integrates with CUGA ([langflow.org](https://www.langflow.org/)) |
-> | **Memory** (optional) | `enable_memory` in `settings.toml` · `uv sync --extra memory` · `cuga start memory` |
-> | **Agent skills** | `SKILL.md` under `.agents/skills` · **`cuga start demo_skills`** (`sandbox_mode = "native"` by default, or **`opensandbox`**) · or **`demo --sandbox`** with `[skills]` on · [Agent skills](#agent-skills) |
+> | **Knowledge** (RAG) | `enable_knowledge=True` (default) · ingest PDFs/Office/HTML/Markdown via **Docling** · **agent-level** + **session-level** scopes · `cuga start demo_knowledge` · [details](#knowledge-base) |
+> | **Agent skills** | `SKILL.md` under `.cuga/skills` (default) · **`cuga start demo_skills`** (`sandbox_mode = "native"` by default, or **`opensandbox`**) · or **`demo --sandbox`** with `[skills]` on · [Agent skills](#agent-skills) |
 > | **Self-host on a cluster** | Helm chart and deploy scripts in [`deployment/`](deployment/) · [Kubernetes guide](deployment/README.md) (local kind/minikube, or registry push for cloud clusters) |
 > | **Save & reuse** _(experimental)_ | `cuga_mode = "save_reuse_fast"` in `settings.toml` |
 >
@@ -55,8 +55,8 @@ Building a domain-specific enterprise agent from scratch is complex and requires
 
 CUGA achieves state-of-the-art performance on leading benchmarks:
 
-- **#1 on [AppWorld](https://appworld.dev/leaderboard)** — a benchmark with 750 real-world tasks across 457 APIs
-- **Top-tier on [WebArena](https://docs.google.com/spreadsheets/d/1M801lEpBbKSNwP-vDBkC_pF7LdyGU1f_ufZb_NWNBZQ/edit?gid=0#gid=0)** (#1 from 02/25 - 09/25) — a complex benchmark for autonomous web agents across application domains
+- **#1 on [AppWorld](https://appworld.dev/leaderboard)** (#1 from 07/25 - 02/26) — a benchmark with 750 real-world tasks across 457 APIs
+- **#1 on [WebArena](https://docs.google.com/spreadsheets/d/1M801lEpBbKSNwP-vDBkC_pF7LdyGU1f_ufZb_NWNBZQ/edit?gid=0#gid=0)** (#1 from 02/25 - 09/25) — a complex benchmark for autonomous web agents across application domains
 
 ### Key Features & Capabilities
 
@@ -73,6 +73,8 @@ CUGA achieves state-of-the-art performance on leading benchmarks:
 - **Save-and-reuse capabilities** _(Experimental)_ — Capture and reuse successful execution paths (plans, code, and trajectories) for faster and consistent behavior across repeated tasks
 
 - **Agent skills** — Package domain workflows as `SKILL.md` files with frontmatter; the agent discovers them and loads full instructions on demand via the `load_skill` tool (see [Agent skills](#agent-skills))
+
+- **Knowledge engine** — Built-in RAG over your documents: ingest PDFs, Office files, HTML, Markdown, and images through **Docling**, then search and reason over them via auto-injected knowledge tools. Documents can be scoped to **agent-level** (permanent, shared across conversations) or **session-level** (per-thread, isolated to a single conversation) — so long-lived reference material and ephemeral per-user uploads can coexist (see [Knowledge Base](#knowledge-base))
 
 ### Manage, publish, and self-hosting
 
@@ -356,6 +358,30 @@ CUGA supports LiteLLM through the OpenAI configuration by overriding the base UR
    MODEL_NAME=openai/gpt-4o                    # Override model name
     ```
 
+### Option 7: RITS Support
+**Setup Instructions:**
+1. Obtain a RITS API key from the RITS platform admin.
+2. Add to your `.env` file:
+   ```env
+   # RITS Configuration — direct RITS endpoint (default preset)
+   RITS_API_KEY=your-rits-api-key  # pragma: allowlist secret
+   AGENT_SETTING_CONFIG="settings.rits.toml"
+
+   # Optional overrides — update MODEL_NAME and RITS_BASE_URL together for
+   # direct RITS setups, since each model has a model-specific URL path.
+   # Setting MODEL_NAME alone will leave you pointed at the previous model's URL.
+   MODEL_NAME=google/gemma-4-31B-it
+   RITS_BASE_URL="https://inference-3scale-apicast-production.apps.rits.fmaas.res.ibm.com/google-gemma-4-31b-it/v1"
+   ```
+
+To front RITS with a local LiteLLM proxy instead, use `AGENT_SETTING_CONFIG="settings.rits.proxy.toml"`.
+
+**Default Values:**
+
+- Model: `google/gemma-4-31B-it` (direct preset)
+- Base URL: gemma-4-31B-it `/v1` endpoint on the RITS 3scale apicast host (direct preset)
+- Local proxy URL: `http://localhost:4000` (proxy preset)
+
 
 ## Configuration Files
 
@@ -366,6 +392,8 @@ CUGA uses TOML configuration files located in `src/cuga/configurations/models/`:
 - `settings.azure.toml` - Azure OpenAI configuration
 - `settings.groq.toml` - Groq configuration
 - `settings.openrouter.toml` - OpenRouter configuration
+- `settings.rits.toml` - RITS configuration (direct endpoint)
+- `settings.rits.proxy.toml` - RITS configuration (local LiteLLM proxy fronting RITS)
 
 Each file contains agent-specific model settings that can be overridden by environment variables.
 
@@ -383,11 +411,16 @@ Agent skills are reusable instruction packs: each skill is a `SKILL.md` file wit
 
 **Where skills live**
 
-| Location | Role |
-| -------- | ---- |
-| `.agents/skills/**/SKILL.md` | Preferred project-local skills path; this is what `npx skills ... -a universal` writes |
+Configure a single root in [`settings.toml`](src/cuga/settings.toml) (`[skills] root`, default **`cuga`**) or via **`DYNACONF_SKILLS__ROOT`** env var. CUGA scans one directory only — no merge across paths.
 
-Use **`~/.config/agents/skills/`** for global installs from `npx skills` with **`-g`**; **`~/.config/cuga/skills/`** is a legacy global path that is still scanned. Legacy **`<CUGA folder>/skills/`** and **`<CUGA folder>/.skills/`** (often `.cuga` via `CUGA_FOLDER`) are still scanned. If the same skill `name` appears in multiple places, project-local skills win over global skills, and `.agents/skills/` wins over legacy project paths.
+| `skills.root` | Project path | Use when |
+| ------------- | ------------ | -------- |
+| `cuga` (default) | `<CUGA folder>/skills/**/SKILL.md` (e.g. `.cuga/skills/`) | CUGA-native layout; keeps skills with other CUGA config |
+| `agents` | `.agents/skills/**/SKILL.md` | [skills.sh](https://skills.sh) / `npx skills` universal installs |
+| `global_agents` | `~/.config/agents/skills/` | Global `npx skills -g` installs |
+| `global_cuga` | `~/.config/cuga/skills/` | Legacy global CUGA path |
+
+**Why default `cuga`?** CUGA already uses `.cuga/` for policy, workspace, and uploads. Keeping skills there avoids colliding with other agents that write `.agents/skills/`. If you install skills with `npx skills`, set `root = "agents"` or copy skills into `.cuga/skills/`.
 
 **`SKILL.md` shape**
 
@@ -416,7 +449,7 @@ The [Anthropic skills repo](https://github.com/anthropics/skills) publishes read
 npx skills add https://github.com/anthropics/skills --skill pptx -a universal
 ```
 
-This creates `.agents/skills/pptx/SKILL.md` for the current project. Restart `cuga start demo_skills` (or your app) so skills are rescanned. Add `-g` if you want the skill installed globally under `~/.config/agents/skills/` instead.
+This creates `.agents/skills/pptx/SKILL.md` for the current project (or set `[skills] root = "agents"` in `settings.toml`). To use the CUGA default layout instead, copy or symlink skills into `.cuga/skills/`. Restart `cuga start demo_skills` (or your app) so skills are rescanned. Add `-g` if you want the skill installed globally under `~/.config/agents/skills/` instead.
 
 ---
 
@@ -518,6 +551,9 @@ When enabled, the agent can search, ingest, and manage documents.
 cuga start demo_knowledge
 ```
 
+> Walk through a full HR-Benefits demo with sample documents and example prompts:
+> **[docs/examples/knowledge_demo/](./docs/examples/knowledge_demo)**
+
 Knowledge is **enabled by default** via `settings.toml`. The SDK auto-injects knowledge tools
 and awareness into the agent, so it knows what documents are available and how to search them.
 
@@ -577,6 +613,24 @@ agent = CugaAgent(tools=[my_tools], enable_knowledge=False)
 #### Supported Document Types
 
 PDF, DOCX, XLSX, PPTX, HTML, Markdown, images, and more (via Docling).
+
+#### Embedding providers + tuning
+
+The knowledge engine ships four built-in provider categories — `fastembed`
+(default, local), `huggingface` (local), `openai` (network, accepts any
+OpenAI-compatible endpoint via `base_url`), and `ollama` (network) — plus
+`openrouter` for one-key-many-models access to embedding models on
+[openrouter.ai/models](https://openrouter.ai/models?output_modalities=embeddings).
+Provider, model, batch size, and concurrency are all set under
+`[knowledge.embeddings]` in `settings.toml` or via CLI overrides
+(`--embeddings-provider`, `--embeddings-base-url`, `--embeddings-api-key`,
+`--embeddings-model`, `--embeddings-batch-size`, `--embeddings-concurrency`).
+
+> **Full provider matrix + tuning guide** — see the
+> [knowledge engine docs](https://docs.cuga.dev/docs/sdk/knowledge/).
+> Switching provider or model invalidates existing vectors (different
+> dim), so the manage UI surfaces a "Re-index recommended" banner
+> automatically.
 
 ---
 
@@ -1063,12 +1117,13 @@ CUGA supports three types of tool integrations. Each approach has its own use ca
 - **Tool Registry**: [./src/cuga/backend/tools_env/registry/README.md](./src/cuga/backend/tools_env/registry/README.md)
 - **Comprehensive example with different tools + MCP**: [./docs/examples/cuga_with_runtime_tools/README.md](Adding Tools)
 - **CUGA as MCP**: [./docs/examples/cuga_as_mcp/README.md](docs/examples/cuga_as_mcp)
+- **Knowledge Engine demo**: [./docs/examples/knowledge_demo/README.md](./docs/examples/knowledge_demo) — agent-level + session-level knowledge walkthrough
 
 </details>
 
 ### Test Scenarios - E2E
 
-All tests are available through `./src/scripts/run_tests.sh`:
+All tests run through pytest (configured in `pyproject.toml`):
 
 **Unit Tests**
 - Registry: OpenAPI integration, MCP server functionality, service configurations
@@ -1089,24 +1144,49 @@ All tests are available through `./src/scripts/run_tests.sh`:
 - SDK functionality: Agent invocation, streaming, tool integration
 - Policy management: Policy loading, matching, and execution via SDK
 
-**Stability Tests** (`run_stability_tests.py`)
+**Stability Tests** (`@pytest.mark.stability` in `src/system_tests/e2e/`)
 - Fast Mode: Get top account by revenue, list accounts, find VP sales high-value accounts
 - CRM Workflows: Contacts management, email operations, tool discovery
 - HF Utterances: Account queries, revenue calculations, playbook execution
-- Execution: Supports local and Docker execution, parallel/sequential modes, cross-version testing
+- Execution: Sequential (`-n0`) so the 88% pass-rate gate aggregates on the controller; CI uses `--stability-threshold 88`
 
 ## Running Tests
 
-Run all tests (unit, integration, and stability):
+Lint:
 
 ```bash
-./src/scripts/run_tests.sh
+uv run ruff check && uv run ruff format --check
 ```
 
-Run unit tests only:
+Run the default suite (excludes manual and pgvector; pgvector needs a container):
 
 ```bash
-./src/scripts/run_tests.sh unit_tests
+uv run pytest
+```
+
+Run the CI-equivalent subset (matches the main `tests.yml` job):
+
+```bash
+uv run pytest -m "not stability and not pgvector and not manual and not e2e and not load"
+uv run pytest src/system_tests/load/load_test_with_mocked_llm.py -m load --load-test-users 5
+```
+
+Run a faster local loop:
+
+```bash
+uv run pytest -m "not stability and not slow and not pgvector and not manual and not e2e and not load"
+```
+
+Run stability tests only (88% pass-rate gate; use `-n0` so threshold aggregation works):
+
+```bash
+uv run pytest -m stability --stability-threshold 88 -n0
+```
+
+Run pgvector tests (requires a running pgvector container):
+
+```bash
+uv run pytest -m pgvector -o addopts="-ra --strict-markers --import-mode=importlib"
 ```
 
 ## Evaluation
