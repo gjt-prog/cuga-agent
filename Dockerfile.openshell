@@ -22,6 +22,13 @@ COPY src/ ./src/
 ENV UV_CACHE_DIR=/tmp/uv-cache
 RUN uv sync --frozen
 
+# Pre-bake the local embedding model at build time (build has network access).
+# The OpenShell policy denies huggingface.co egress at runtime, so without this
+# the local embedding function fails. The entrypoint seeds this baked cache into
+# writable /tmp, and HF_HUB_OFFLINE=1 keeps runtime model loads fully offline.
+RUN FASTEMBED_CACHE_PATH=/app/fastembed-cache \
+    /app/.venv/bin/python -c "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5')"
+
 RUN mkdir -p /app/cuga_workspace /sandbox/cuga_workspace /tmp/cuga/dbs /tmp/cuga/logging && \
     cp src/cuga/demo_tools/huggingface/contacts.txt /app/cuga_workspace/contacts.txt && \
     cp src/cuga/demo_tools/huggingface/cuga_knowledge.md /app/cuga_workspace/cuga_knowledge.md && \
@@ -38,6 +45,9 @@ ENV PATH="/app/.venv/bin:/usr/local/bin:$PATH" \
     CUGA_DBS_DIR=/tmp/cuga/dbs \
     CUGA_LOGGING_DIR=/tmp/cuga/logging \
     CUGA_FOLDER=/tmp/cuga/policies \
+    FASTEMBED_CACHE_PATH=/tmp/cuga/fastembed \
+    HF_HOME=/tmp/cuga/hf \
+    HF_HUB_OFFLINE=1 \
     PYTHONDONTWRITEBYTECODE=1
 
 EXPOSE 7860
