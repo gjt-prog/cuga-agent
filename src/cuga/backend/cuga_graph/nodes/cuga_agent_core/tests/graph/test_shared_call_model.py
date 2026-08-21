@@ -41,6 +41,11 @@ class _TestAdapter(CoreGraphAdapter):
         return override if override is not None else getattr(state, "_max_steps", 50)
 
 
+class _ProbingAdapter(_TestAdapter):
+    def get_tools_needing_probing(self) -> frozenset:
+        return frozenset({"file_readfile"})
+
+
 # ── Test state factory ─────────────────────────────────────────────────────
 
 
@@ -303,7 +308,59 @@ async def test_configurable_llm_overrides_base_model(mock_summarize):
     assert result.update["final_answer"] == "The answer is 7."
 
 
-# ── 8. Empty visible content falls back to reasoning / execution output ─────
+# ── 8. Multi-block response truncated when a probing tool is referenced ───
+
+
+@pytest.mark.asyncio
+@patch(
+    "cuga.backend.cuga_graph.nodes.cuga_agent_core.graph.shared_nodes.apply_context_summarization",
+    new_callable=AsyncMock,
+)
+async def test_multi_block_response_truncated_when_probing_tool_referenced(mock_summarize):
+    mock_summarize.side_effect = lambda messages, *args, **kwargs: messages
+
+    adapter = _ProbingAdapter()
+    state = _make_state()
+    model = _mock_model(
+        "```python\nres = await file_readfile('./x')\nprint(res)\n```\n"
+        "```python\nres_2 = res[0][0:15]\nprint(res_2)\n```"
+    )
+    settings = _mock_settings()
+
+    node = _get_factory()(adapter, model, settings)
+    result = await node(state, config=None)
+
+    assert result.update["script"] == "res = await file_readfile('./x')\nprint(res)"
+
+
+@pytest.mark.asyncio
+@patch(
+    "cuga.backend.cuga_graph.nodes.cuga_agent_core.graph.shared_nodes.apply_context_summarization",
+    new_callable=AsyncMock,
+)
+async def test_multi_block_response_not_truncated_when_no_probing_tools(mock_summarize):
+    """Regression guard: an adapter with no probing-required tools (the
+    default, e.g. Supervisor or Lite before any weak-schema tool appears)
+    must keep combining all blocks exactly as before this change."""
+    mock_summarize.side_effect = lambda messages, *args, **kwargs: messages
+
+    adapter = _TestAdapter()
+    state = _make_state()
+    model = _mock_model(
+        "```python\nres = await file_readfile('./x')\nprint(res)\n```\n"
+        "```python\nres_2 = res[0][0:15]\nprint(res_2)\n```"
+    )
+    settings = _mock_settings()
+
+    node = _get_factory()(adapter, model, settings)
+    result = await node(state, config=None)
+
+    assert result.update["script"] == (
+        "res = await file_readfile('./x')\nprint(res)\n\nres_2 = res[0][0:15]\nprint(res_2)"
+    )
+
+
+# ── 9. Empty visible content falls back to reasoning / execution output ─────
 
 
 @pytest.mark.asyncio
@@ -353,3 +410,60 @@ async def test_empty_content_falls_back_to_execution_output(mock_summarize):
 
     assert result.goto == END
     assert result.update["final_answer"] == "avg=200\ntotal=600"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@patch(
+    "cuga.backend.cuga_graph.nodes.cuga_agent_core.graph.shared_nodes.apply_context_summarization",
+    new_callable=AsyncMock,
+)
+async def test_reasoning_with_control_tokens_not_surfaced_as_final_answer(mock_summarize):
+    mock_summarize.side_effect = lambda messages, *args, **kwargs: messages
+
+    adapter = _TestAdapter()
+    state = _make_state(
+        messages=[
+            HumanMessage(content="analyze spendings"),
+            HumanMessage(content="Execution output:\navg=200\ntotal=600"),
+        ]
+    )
+    model = _mock_model("")
+    model.ainvoke = AsyncMock(
+        return_value=_mock_response(
+            "", reasoning="...call getdata<|start|>assistant<|channel|>final<|message|>42"
+        )
+    )
+    settings = _mock_settings()
+
+    node = _get_factory()(adapter, model, settings)
+    result = await node(state, config=None)
+
+    assert result.goto == END
+    assert "<|" not in result.update["final_answer"]
+    assert result.update["final_answer"] == "avg=200\ntotal=600"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@patch(
+    "cuga.backend.cuga_graph.nodes.cuga_agent_core.graph.shared_nodes.apply_context_summarization",
+    new_callable=AsyncMock,
+)
+async def test_reasoning_mentioning_other_special_tokens_is_still_surfaced(mock_summarize):
+    """Only the harmony vocabulary blocks the fallback — reasoning that merely
+    discusses other <|...|>-style markers is a legitimate answer."""
+    mock_summarize.side_effect = lambda messages, *args, **kwargs: messages
+
+    adapter = _TestAdapter()
+    state = _make_state()
+    model = _mock_model("")
+    reasoning = "The delimiter <|custom|> is not part of the harmony spec."
+    model.ainvoke = AsyncMock(return_value=_mock_response("", reasoning=reasoning))
+    settings = _mock_settings()
+
+    node = _get_factory()(adapter, model, settings)
+    result = await node(state, config=None)
+
+    assert result.goto == END
+    assert result.update["final_answer"] == reasoning

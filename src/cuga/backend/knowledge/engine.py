@@ -56,6 +56,18 @@ _REINDEX_WORKER_TIMEOUT_S = 1800  # 30 min; matches the deferred-flip wall-clock
 # that clears the busy flag. done_callback discards on completion.
 _BACKGROUND_REINDEX_TASKS: set[Any] = set()
 
+# File-task statuses that mean "this file is done, whatever the parent row says".
+# Anything else — including a MISSING status — counts as still in flight. The
+# ingest worker's progress emits write {filename, stage, progress} with no
+# status on purpose (see _emit_progress), so "unknown" must never be read as
+# terminal: doing so would let a second ingest race a live insert.
+_TERMINAL_FILE_STATUSES = frozenset({"indexed", "failed", "skipped", "cancelled", "superseded"})
+
+# How long a delete waits for an ingest it could not cancel (already past the
+# point of no return) to finish writing. Bounded so a wedged provider call
+# cannot hang the delete request; on expiry the delete proceeds anyway.
+_DELETE_INGEST_WAIT_S = 30
+
 
 # Docling's plugin factory emits a WARNING every time it scans for plugins:
 #   "The plugin langchain_docling will not be loaded because Docling is being
@@ -786,6 +798,22 @@ class ReindexInProgressError(Exception):
     pass
 
 
+class IngestStillFinishingError(Exception):
+    """A delete could not complete because an uncancellable ingest is still writing.
+
+    Retryable: the ingest is past its point of no return, so it cannot be
+    stopped and it will still call ``add_document``. Deleting now would report
+    success and then be undone by that write.
+    """
+
+    def __init__(self, filename: str, task_id: str):
+        self.filename = filename
+        self.task_id = task_id
+        super().__init__(
+            f"An ingest for {filename} is still finishing (task {task_id}); retry the delete shortly."
+        )
+
+
 class ReindexSupersededError(Exception):
     """Stale ingest worker: ``_apply_generation`` moved past the captured value."""
 
@@ -793,6 +821,15 @@ class ReindexSupersededError(Exception):
         self.worker_gen = worker_gen
         self.current_gen = current_gen
         super().__init__(f"Reindex superseded: gen {worker_gen} -> {current_gen}")
+
+
+class IngestCancelledError(Exception):
+    """Ingest worker observed a user cancel at one of its checkpoints."""
+
+    def __init__(self, task_id: str, filename: str):
+        self.task_id = task_id
+        self.filename = filename
+        super().__init__(f"Ingest cancelled by user: {filename} (task {task_id})")
 
 
 # --- Prepared update result ---
@@ -851,6 +888,61 @@ def _detect_accelerator(use_gpu: bool) -> tuple[str, list[str]]:
 # --- Embedding factory ---
 
 
+# Substrings that mean "the model files on disk are missing or truncated",
+# i.e. a half-finished download rather than a user/config problem. Kept
+# deliberately narrow: an unsupported model name, a rejected API key or an
+# offline hub must NOT match, or we would silently re-download on every start
+# and hide a real misconfiguration.
+_CORRUPT_MODEL_CACHE_MARKERS = (
+    "no_suchfile",
+    "file doesn't exist",
+    "no such file",
+    "protobuf parsing failed",
+)
+
+
+def _is_corrupt_model_cache_error(exc: BaseException) -> bool:
+    """True when ``exc`` looks like an incomplete/corrupt on-disk model cache."""
+    if isinstance(exc, FileNotFoundError):
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(marker in text for marker in _CORRUPT_MODEL_CACHE_MARKERS)
+
+
+def _model_cache_root_from_error(exc: BaseException, cache_dir: str | None = None) -> Path | None:
+    """Pull the HuggingFace ``models--<repo>`` dir out of a path in the error text.
+
+    onnxruntime/huggingface_hub both embed the absolute failing path in their
+    messages, which is the only reliable link from "this load failed" to "this
+    cache entry is bad" — the fastembed model name (BAAI/bge-small-en-v1.5)
+    does not match its backing repo dir (models--qdrant--bge-small-en-v1.5-onnx-q).
+    Returns None when no such path is present, in which case we must not guess.
+
+    ``cache_dir`` (when known) constrains the result to live inside the cache:
+    the caller feeds this straight to ``rmtree``, so a path parsed out of an
+    arbitrary string must never be able to point somewhere else.
+    """
+    match = re.search(r"(/[^\s'\"]*?/models--[^/\s'\"]+)(?:/|\s|$)", str(exc))
+    if not match:
+        return None
+    candidate = Path(match.group(1))
+    if not candidate.name.startswith("models--"):
+        return None
+    if cache_dir:
+        try:
+            candidate.resolve().relative_to(Path(cache_dir).resolve())
+        except (ValueError, OSError):
+            return None
+    return candidate
+
+
+def _purge_model_cache(cache_root: Path) -> None:
+    """Delete a model's cache entry plus its sibling HF lock dir."""
+    shutil.rmtree(cache_root, ignore_errors=True)
+    lock_dir = cache_root.parent / ".locks" / cache_root.name
+    shutil.rmtree(lock_dir, ignore_errors=True)
+
+
 class _FastEmbedEmbeddings(Embeddings):
     """LangChain Embeddings adapter around fastembed.TextEmbedding.
 
@@ -874,7 +966,27 @@ class _FastEmbedEmbeddings(Embeddings):
         kwargs: dict[str, Any] = {"cache_dir": cache_dir, "local_files_only": local_files_only}
         if providers:
             kwargs["providers"] = providers
-        self._model = TextEmbedding(model_name, **kwargs)
+        try:
+            self._model = TextEmbedding(model_name, **kwargs)
+        except Exception as exc:
+            # A purged or interrupted download leaves a dangling snapshot
+            # symlink (and a 0-byte .incomplete blob). HuggingFace then still
+            # believes the model is cached, so onnxruntime hard-fails with
+            # NoSuchFile on EVERY subsequent start — the user is bricked with
+            # no path out short of deleting a hashed dir under /var/folders.
+            # Purge that one entry and re-fetch so it heals invisibly.
+            cache_root = _model_cache_root_from_error(exc, cache_dir)
+            if local_files_only or cache_root is None or not _is_corrupt_model_cache_error(exc):
+                raise
+            logger.warning(
+                f"Embedding model cache for {model_name} is incomplete or corrupt "
+                f"({cache_root.name}); purging and re-downloading once."
+            )
+            _purge_model_cache(cache_root)
+            # Exactly once. A second failure is a genuine fault (offline, out of
+            # disk, upstream gone) and must surface instead of looping.
+            self._model = TextEmbedding(model_name, **kwargs)
+            logger.info(f"Embedding model cache for {model_name} recovered after re-download")
         # Record what onnxruntime actually loaded so the engine can log honestly.
         self._active_providers = self._detect_active_providers()
         # GPU-aware embed kwargs:
@@ -1690,6 +1802,17 @@ class KnowledgeEngine:
         # Default embeddings (lazy — initialized on first use to speed up startup)
         self._default_embeddings = None
         self._default_embedding_dim = None
+        # True while the first embedder init is running. A cold cache means
+        # downloading a multi-hundred-MB model, and reporting that as
+        # "unavailable" makes a first run look broken — health reports
+        # "preparing" instead so the UI can show progress, not an error.
+        self._embedder_initializing = False
+        # Serializes _ensure_embeddings across its callers (probe, per-collection
+        # resolve, ingest tokenizer — several run in to_thread workers). Without
+        # it two callers can both pass the `is None` check and load the model
+        # twice (duplicate ONNX session + download). HF file-locking protects the
+        # blob, not a double load.
+        self._embedder_init_lock = threading.Lock()
 
         # Vector store LRU cache (bounded)
         self._vector_stores: collections.OrderedDict[str, VectorStoreAdapter] = collections.OrderedDict()
@@ -1721,6 +1844,26 @@ class KnowledgeEngine:
 
         # Active tasks for cancellation
         self._active_tasks: dict[str, asyncio.Event] = {}
+
+        # Task ids past the point of no return: the worker cleared its last
+        # cancel checkpoint and WILL write to the vector store. ``cancel_task``
+        # must not terminalize these. Writing "cancelled" here would be a lie,
+        # and worse, it would release the dedup guard — a re-upload of the same
+        # filename would then race this insert, and since
+        # _insert_documents_async does delete_by_source + add_documents under
+        # replace_duplicates, the LOSER of that race wins the content. The
+        # user's actual flow ("cancel, re-upload a corrected file") hits this
+        # head on, so a terminal write here would corrupt data.
+        self._uncancellable_tasks: set[str] = set()
+
+        # Serializes "read a task's status, decide, write a terminal status".
+        # update_task is last-write-wins with no CAS, so without this a
+        # worker's status="completed" could land between cancel_task's read
+        # and its UPDATE — leaving the row "cancelled" while the document is
+        # actually indexed. Holding this across read+decide+write makes the
+        # check-then-act atomic: whichever side goes second re-reads, sees the
+        # terminal status the other just wrote, and declines to overwrite it.
+        self._task_write_lock = asyncio.Lock()
 
         # Reindex coordination flags (in-memory, single-process only — flock ensures this)
         self._reindex_in_progress: set[str] = set()
@@ -1924,9 +2067,34 @@ class KnowledgeEngine:
 
     def _ensure_embeddings(self) -> None:
         """Initialize embeddings on first use (not at engine startup)."""
-        if self._default_embeddings is None:
-            self._default_embeddings = create_embeddings(self._config)
-            self._default_embedding_dim = _get_embedding_dim(self._default_embeddings)
+        # Double-checked lock: the fast path stays lock-free once loaded, and the
+        # check-and-set is serialized so concurrent callers can't both construct
+        # the model. (Several callers reach here from different to_thread workers:
+        # probe, per-collection resolve, ingest tokenizer.)
+        if self._default_embeddings is not None:
+            return
+        with self._embedder_init_lock:
+            if self._default_embeddings is not None:
+                return
+            # Flagged for the health probe: on a cold cache this call downloads
+            # the model, and that wait must read as "preparing", not "broken".
+            self._embedder_initializing = True
+            try:
+                self._default_embeddings = create_embeddings(self._config)
+                self._default_embedding_dim = _get_embedding_dim(self._default_embeddings)
+            except Exception:
+                # Half-init guard: _get_embedding_dim does a live embed_query call,
+                # so it can fail *after* the embedder object is built. Don't leave
+                # _default_embeddings set with a None dim — the lock-free fast path
+                # above would then skip re-init forever, and the ingest path would
+                # later pass dim=None to set_collection_config and blow up as a
+                # confusing sqlite IntegrityError (embedding_dim NOT NULL). Clear
+                # both so the next _ensure_embeddings retries cleanly.
+                self._default_embeddings = None
+                self._default_embedding_dim = None
+                raise
+            finally:
+                self._embedder_initializing = False
             active = getattr(self._default_embeddings, "_active_providers", None)
             extra = f", onnx_active={active}" if active else ""
             logger.info(
@@ -2188,6 +2356,27 @@ class KnowledgeEngine:
 
     # --- Ingest ---
 
+    @staticmethod
+    def _blocks_reupload(task: dict[str, Any], filename: str) -> bool:
+        """Does this task still own ``filename`` for dedup purposes?
+
+        A task blocks only while its PARENT status is non-terminal — that is
+        the outcome record, and it is why ``cancel_task`` must persist one
+        (#685). The per-file check is defence in depth: a file-task entry has
+        NO ``status`` key while it is actively embedding (a progress emit
+        replaces the whole entry), so unknown MUST count as non-terminal.
+        Reading unknown as terminal would let a second ingest race a live
+        insert — the exact duplicate-content race this guard exists to stop.
+        """
+        if task.get("status") not in ("pending", "running"):
+            return False
+        ft = (task.get("file_tasks") or {}).get(filename)
+        if ft is None:
+            return False
+        if isinstance(ft, dict) and ft.get("status", "processing") in _TERMINAL_FILE_STATUSES:
+            return False
+        return True
+
     async def _sanitize_and_validate(
         self, collection: str, file_path: Path, replace_duplicates: bool, original_filename: str | None = None
     ) -> str:
@@ -2212,7 +2401,7 @@ class KnowledgeEngine:
         # The atomic guarantee lives in ``_create_task_entry_internal``; this
         # check just surfaces a clear 409 earlier in the request flow.
         for t in pending:
-            if filename in (t.get("file_tasks") or {}):
+            if self._blocks_reupload(t, filename):
                 raise DocumentExistsError(
                     f"{filename} (an ingest for this file is already {t.get('status', 'pending')}; "
                     f"task_id={t.get('task_id')})"
@@ -2247,9 +2436,7 @@ class KnowledgeEngine:
         async with self._get_collection_lock(collection):
             existing = None
             for t in await self._metadata.list_tasks(collection):
-                if t.get("status") not in ("pending", "running"):
-                    continue
-                if filename in (t.get("file_tasks") or {}):
+                if self._blocks_reupload(t, filename):
                     existing = t
                     break
             if existing is not None:
@@ -2335,21 +2522,48 @@ class KnowledgeEngine:
             if current != worker_apply_gen:
                 raise ReindexSupersededError(worker_apply_gen, current)
 
+        def _check_cancelled() -> None:
+            # Cheap and synchronous, exactly like _check_supersede. Called at
+            # every point where abandoning the ingest costs nothing — and
+            # deliberately NOT after the insert commits, because by then the
+            # chunks are in the store and completing is the honest outcome.
+            if cancel_event.is_set():
+                raise IngestCancelledError(task_id, filename)
+
         try:
+            # BEFORE the status="running" write, not after. A cancel that lands
+            # while this worker is queued on _ingest_sem already wrote
+            # status="cancelled"; flipping the row back to "running" here would
+            # re-block the dedup guard for the rest of the ingest. Do not
+            # reorder these two statements.
+            _check_cancelled()
+
+            # The event alone is not enough. ``cancel_task`` can land before
+            # ``_run_ingest`` registers it at all — routes.py creates the task
+            # row and only then schedules that coroutine, so in that window
+            # ``_active_tasks`` has no entry, cancel_task has nothing to set,
+            # and this worker builds its own fresh (unset) event. An
+            # in-memory-only check sails past a row that is already terminal,
+            # writes "running", and goes on to insert — resurrecting a task the
+            # dedup guard has already released, which is precisely the
+            # duplicate-content race the point of no return exists to prevent.
+            # Trust the persisted outcome, not just the in-process signal.
+            persisted = await self._metadata.get_task(task_id)
+            if persisted and persisted.get("status") in ("completed", "failed", "cancelled"):
+                # Return rather than raise: the row already carries its real
+                # outcome and the cancel handler would overwrite it.
+                logger.info(
+                    f"Task {task_id}: already {persisted['status']} before the worker started; "
+                    f"not running {filename}"
+                )
+                return
+
             await self._metadata.update_task(task_id, status="running")
             await self._metadata.update_task(
                 task_id,
                 file_tasks={filename: {"filename": filename, "status": "processing"}},
             )
             logger.info(f"Task {task_id}: pending -> running for {filename} in {collection}")
-
-            if cancel_event.is_set():
-                await self._metadata.update_task(
-                    task_id,
-                    status="cancelled",
-                    file_tasks={filename: {"filename": filename, "status": "skipped"}},
-                )
-                return
 
             _check_supersede()
 
@@ -2359,6 +2573,11 @@ class KnowledgeEngine:
             if not docs:
                 raise ValueError(f"No content extracted from {filename}")
             _check_supersede()
+            # The checkpoint that makes cancelling a multi-minute Docling parse
+            # actually work. asyncio.to_thread above is not interruptible, so
+            # the parse burns CPU until it returns — but the worker abandons
+            # here without ever touching the vector store.
+            _check_cancelled()
 
             # C5 (issue #183 step 6): emit "parsed" stage so callers polling
             # get_ingestion_status see progress as soon as Docling finishes
@@ -2390,6 +2609,11 @@ class KnowledgeEngine:
             progress_futures: list[_cf.Future] = []
 
             async def _emit_progress(stage: str, done: int, total: int) -> None:
+                # Like the "parsed" emit above, this omits ``status`` on
+                # purpose, and ``update_task`` replaces the whole entry — so a
+                # task killed here leaves a status-less file-task behind.
+                # Readers must tolerate that; see ``normalize_file_tasks`` in
+                # knowledge/metadata/base.py (#683).
                 await self._metadata.update_task(
                     task_id,
                     file_tasks={
@@ -2494,6 +2718,10 @@ class KnowledgeEngine:
                 logger.debug(f"Sample metadata for {filename}: {docs[0].metadata}")
 
             _check_supersede()
+            # Last cheap exit: abandoning here avoids even queuing behind the
+            # collection lock, which a large concurrent ingest may hold for
+            # minutes.
+            _check_cancelled()
 
             logger.info(
                 f"Inserting {len(docs)} chunks into {self._knowledge_vector_backend()} "
@@ -2512,8 +2740,20 @@ class KnowledgeEngine:
                 # NEW provider/dim and write old-embedder vectors under it — a
                 # name-vs-content mismatch within the target collection.
                 _check_supersede()
+                _check_cancelled()
                 await self._ensure_collection_config(collection)
                 await self._ensure_vector_store_cached(collection)
+                # POINT OF NO RETURN. Past this line the chunks land, so
+                # cancel_task must stop writing a terminal status for this task
+                # (see _uncancellable_tasks) — otherwise it would release the
+                # dedup guard and let a re-upload race this insert.
+                #
+                # The check and the add are adjacent and synchronous ON PURPOSE:
+                # with no await between them the event loop cannot interleave
+                # cancel_task, which is what makes the handoff atomic without a
+                # lock. DO NOT introduce an await here.
+                _check_cancelled()
+                self._uncancellable_tasks.add(task_id)
                 result = await self._insert_documents_async(
                     collection,
                     docs,
@@ -2584,20 +2824,23 @@ class KnowledgeEngine:
             stage_timings["finalize_s"] = round(time.monotonic() - t_finalize, 3)
             stage_timings["total_s"] = round(time.monotonic() - start, 3)
 
-            await self._metadata.update_task(
-                task_id,
-                status="completed",
-                processed_files=1,
-                successful_files=1,
-                file_tasks={
-                    filename: {
-                        "filename": filename,
-                        "status": "indexed",
-                        "duration_seconds": round(duration, 2),
-                        "timings": dict(stage_timings),
-                    }
-                },
-            )
+            # Locked so this cannot land between cancel_task's read and its
+            # write. Whichever side goes second re-reads and stands down.
+            async with self._task_write_lock:
+                await self._metadata.update_task(
+                    task_id,
+                    status="completed",
+                    processed_files=1,
+                    successful_files=1,
+                    file_tasks={
+                        filename: {
+                            "filename": filename,
+                            "status": "indexed",
+                            "duration_seconds": round(duration, 2),
+                            "timings": dict(stage_timings),
+                        }
+                    },
+                )
             logger.info(
                 f"Ingested {filename} -> {len(docs)} chunks in {collection} "
                 f"(added={result.get('num_added', 0)}, skipped={result.get('num_skipped', 0)})"
@@ -2642,43 +2885,69 @@ class KnowledgeEngine:
                 chunks=len(docs),
             )
 
+        except IngestCancelledError:
+            # Same trick as the supersede handler below: parent status is
+            # "cancelled" because the SQL CHECK admits no new value, and the
+            # user-cancel nuance lives in the file-task entry. cancel_task has
+            # usually written this already — repeating it is harmless and
+            # covers the case where the event was set without a live row write
+            # (e.g. cancel arrived while the worker was queued on _ingest_sem).
+            duration = time.monotonic() - start
+            logger.info(f"Task {task_id} cancelled by user for {filename} after {duration:.1f}s")
+            async with self._task_write_lock:
+                await self._metadata.update_task(
+                    task_id,
+                    status="cancelled",
+                    processed_files=1,
+                    file_tasks={
+                        filename: {
+                            "filename": filename,
+                            "status": "cancelled",
+                            "reason": "cancelled by user",
+                            "duration_seconds": round(duration, 2),
+                        }
+                    },
+                )
         except ReindexSupersededError as e:
             # SQL status "cancelled" (CHECK admits no new value); supersede
             # audit lives in file_tasks[filename].
             duration = time.monotonic() - start
             logger.info(f"Task {task_id} superseded for {filename} after {duration:.1f}s ({e})")
-            await self._metadata.update_task(
-                task_id,
-                status="cancelled",
-                processed_files=1,
-                file_tasks={
-                    filename: {
-                        "filename": filename,
-                        "status": "superseded",
-                        "reason": f"config changed mid-ingest (gen {e.worker_gen} -> {e.current_gen})",
-                        "duration_seconds": round(duration, 2),
-                    }
-                },
-            )
+            async with self._task_write_lock:
+                await self._metadata.update_task(
+                    task_id,
+                    status="cancelled",
+                    processed_files=1,
+                    file_tasks={
+                        filename: {
+                            "filename": filename,
+                            "status": "superseded",
+                            "reason": f"config changed mid-ingest (gen {e.worker_gen} -> {e.current_gen})",
+                            "duration_seconds": round(duration, 2),
+                        }
+                    },
+                )
         except Exception as e:
             duration = time.monotonic() - start
             logger.error(f"Failed to ingest {filename}: {e}")
-            await self._metadata.update_task(
-                task_id,
-                status="failed",
-                processed_files=1,
-                failed_files=1,
-                file_tasks={
-                    filename: {
-                        "filename": filename,
-                        "status": "failed",
-                        "error": str(e),
-                        "duration_seconds": round(duration, 2),
-                    }
-                },
-            )
+            async with self._task_write_lock:
+                await self._metadata.update_task(
+                    task_id,
+                    status="failed",
+                    processed_files=1,
+                    failed_files=1,
+                    file_tasks={
+                        filename: {
+                            "filename": filename,
+                            "status": "failed",
+                            "error": str(e),
+                            "duration_seconds": round(duration, 2),
+                        }
+                    },
+                )
         finally:
             self._active_tasks.pop(task_id, None)
+            self._uncancellable_tasks.discard(task_id)
 
     async def _insert_documents_async(
         self,
@@ -2815,6 +3084,54 @@ class KnowledgeEngine:
 
     # --- Delete (5-step compensating flow per plan) ---
 
+    async def _stop_ingest_for(self, collection: str, filename: str) -> bool:
+        """Stop any in-flight ingest that owns ``filename``. Returns whether one was.
+
+        Delete used to ignore active tasks entirely (#691), which made the
+        button do nothing in two different ways:
+
+        * during a first upload the documents row does not exist yet — it is
+          written near the END of ingest — so ``mark_deleting`` found nothing
+          and the delete 404'd while the ingest carried on and indexed it;
+        * during a re-upload the delete succeeded, then the ingest reached
+          ``add_document`` and wrote the document straight back.
+
+        Must be called BEFORE taking the collection lock: waiting on a worker
+        while holding that lock would deadlock, since the worker needs it to
+        insert.
+        """
+        stopped = False
+        for task in await self._metadata.list_tasks(collection):
+            if not self._blocks_reupload(task, filename):
+                continue
+            task_id = task["task_id"]
+            logger.info(f"Delete {filename}: stopping in-flight ingest {task_id}")
+            await self.cancel_task(task_id)
+            stopped = True
+            # A cancel past the point of no return is refused, and that worker
+            # WILL write the document. Wait for it to reach a terminal status —
+            # which it only does after add_document — so our delete runs last
+            # instead of being resurrected by it.
+            deadline = time.monotonic() + _DELETE_INGEST_WAIT_S
+            while time.monotonic() < deadline:
+                current = await self._metadata.get_task(task_id)
+                if not current or current.get("status") in ("completed", "failed", "cancelled"):
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                # Do NOT delete anyway. That worker is past the point of no
+                # return, so it still has an add_document ahead of it: deleting
+                # now would report success and then be silently undone by that
+                # write — reintroducing the exact resurrection this method
+                # exists to prevent, just in the timeout window. Fail
+                # retryably instead of lying about the outcome.
+                logger.warning(
+                    f"Delete {filename}: ingest {task_id} still writing after "
+                    f"{_DELETE_INGEST_WAIT_S}s; refusing to report a delete it would undo"
+                )
+                raise IngestStillFinishingError(filename, task_id)
+        return stopped
+
     async def delete_document(self, collection: str, filename: str) -> None:
         """Delete a document. Idempotent compensating flow across stores."""
         await self._ensure_metadata_ready()
@@ -2836,6 +3153,9 @@ class KnowledgeEngine:
                 f"Reindex in progress for {collection}; deletes are rejected until it completes."
             )
 
+        # Outside the lock on purpose — see _stop_ingest_for.
+        stopped_ingest = await self._stop_ingest_for(collection, filename)
+
         async with self._get_collection_lock(collection):
             # Re-check under the lock: reindex() flags the collection AND
             # snapshots its file_list under this same lock, so a delete that
@@ -2846,6 +3166,13 @@ class KnowledgeEngine:
                     f"Reindex in progress for {collection}; deletes are rejected until it completes."
                 )
             if not await self._metadata.mark_deleting(collection, filename):
+                if stopped_ingest:
+                    # There is no documents row because the ingest never got
+                    # far enough to write one — but we did stop it, so the
+                    # user's intent ("make this not be here") is satisfied.
+                    # 404 here would be a lie about work we actually did.
+                    logger.info(f"Delete {filename}: ingest stopped before it indexed anything")
+                    return
                 raise DocumentNotFoundError(filename)
             await self._ensure_vector_store_cached(collection)
             try:
@@ -3592,25 +3919,64 @@ class KnowledgeEngine:
         return await self._metadata.get_task(task_id)
 
     async def cancel_task(self, task_id: str) -> dict[str, Any] | None:
-        await self._ensure_metadata_ready()
-        task = await self._metadata.get_task(task_id)
-        if not task:
-            return None
-        if task["status"] in ("completed", "failed", "cancelled"):
-            return task
+        """Cancel a task and record the OUTCOME, not just the intent.
 
+        The in-memory event alone was not enough (#685): for a ``running``
+        task nothing was persisted, so the row stayed ``running`` forever and
+        the pending/running dedup guard kept 409-ing re-uploads of that
+        filename — it also held a ``max_pending_tasks`` slot and blocked
+        reindex, all three of which read the same status filter.
+        """
+        await self._ensure_metadata_ready()
+
+        # Set the event BEFORE taking the write lock. The worker's checkpoints
+        # are synchronous reads of this event, so setting it first means a
+        # worker that runs while we wait for the lock still sees the cancel.
         cancel_event = self._active_tasks.get(task_id)
         if cancel_event:
             cancel_event.set()
 
-        if task["status"] == "pending":
-            file_tasks = task["file_tasks"]
-            for ft in file_tasks.values():
-                if ft["status"] == "pending":
-                    ft["status"] = "skipped"
-            await self._metadata.update_task(task_id, status="cancelled", file_tasks=file_tasks)
-            logger.debug(f"Task {task_id}: cancelled (was pending)")
+        # Read, decide and write under one lock. Without it the worker's
+        # status="completed" could land between our read and our UPDATE,
+        # leaving the row "cancelled" while the document is really indexed.
+        async with self._task_write_lock:
+            task = await self._metadata.get_task(task_id)
+            if not task:
+                return None
+            # Re-read inside the lock: if the worker reached a terminal status
+            # while we were waiting, that is the truth — do not overwrite it.
+            if task["status"] in ("completed", "failed", "cancelled"):
+                return task
+            return await self._cancel_task_locked(task_id, task)
 
+    async def _cancel_task_locked(self, task_id: str, task: dict[str, Any]) -> dict[str, Any] | None:
+        """Write the cancellation. Caller must hold ``_task_write_lock``."""
+        if task_id in self._uncancellable_tasks:
+            # Past the point of no return: the insert is in flight and the
+            # document WILL land. Persisting "cancelled" would both lie and
+            # release the dedup guard, letting a re-upload race that insert.
+            # Return the live row; the caller keeps polling and sees the real
+            # terminal status.
+            logger.info(f"Task {task_id}: cancel requested but ingest is past the point of no return")
+            return task
+
+        file_tasks = task.get("file_tasks") or {}
+        if isinstance(file_tasks, dict):
+            for ft in file_tasks.values():
+                if not isinstance(ft, dict):
+                    continue
+                # A missing ``status`` means a progress emit replaced the entry
+                # mid-ingest, so the file is still in flight — default
+                # NON-terminal or we would leave it unmarked (#683).
+                if ft.get("status", "processing") not in _TERMINAL_FILE_STATUSES:
+                    ft["status"] = "cancelled" if task["status"] == "running" else "skipped"
+        else:
+            file_tasks = {}
+
+        await self._metadata.update_task(
+            task_id, status="cancelled", processed_files=1, file_tasks=file_tasks
+        )
+        logger.info(f"Task {task_id}: cancelled (was {task['status']})")
         return await self._metadata.get_task(task_id)
 
     # --- Knowledge config update (prepare / commit) ---
@@ -3899,6 +4265,7 @@ class KnowledgeEngine:
                 "enabled": self._config.enabled,
                 "agent_level_enabled": self._config.agent_level_enabled,
                 "session_level_enabled": self._config.session_level_enabled,
+                "citations_enabled": getattr(self._config, "citations_enabled", True),
                 "rag_profile": self._config.rag_profile,
                 "embedding_provider": self._config.embedding_provider,
                 "embedding_model": self._config.embedding_model,
@@ -4019,14 +4386,23 @@ class KnowledgeEngine:
         endpoint doesn't hit the provider on every call. Cache is invalidated on
         config apply (see ``commit_knowledge_update``) so fixing a key re-probes.
 
-        Returns ``{available, error, model}``; ``available`` is None when
-        knowledge is disabled (nothing to probe).
+        Returns ``{available, error, model, state}``. ``available`` is None when
+        knowledge is disabled (nothing to probe) or while the embedder is still
+        being prepared; ``state`` is one of "disabled" / "preparing" /
+        "available" / "unavailable" so the UI can tell a cold start apart from
+        a real fault.
         """
         import time as _t
 
         model = f"{self._config.embedding_provider or ''}/{self._config.embedding_model or ''}".strip("/")
         if not self._config.enabled:
-            return {"available": None, "error": None, "model": model}
+            return {"available": None, "error": None, "model": model, "state": "disabled"}
+        # A first-time init is already in flight. On a cold cache that means a
+        # multi-hundred-MB download, so report progress rather than blocking the
+        # polled health endpoint — or, worse, calling _ensure_embeddings again
+        # here and kicking off a duplicate download of the same model.
+        if self._default_embeddings is None and self._embedder_initializing:
+            return {"available": None, "error": None, "model": model, "state": "preparing"}
         try:
             cfg_hash = self._config.vector_config_hash()
         except Exception:
@@ -4034,7 +4410,12 @@ class KnowledgeEngine:
         now = _t.monotonic()
         cache = self._embedder_probe_cache
         if cache and cache[0] == cfg_hash and (now - cache[3]) < 60:
-            return {"available": cache[1], "error": cache[2], "model": model}
+            return {
+                "available": cache[1],
+                "error": cache[2],
+                "model": model,
+                "state": "available" if cache[1] else "unavailable",
+            }
 
         available, error = True, None
         try:
@@ -4054,7 +4435,12 @@ class KnowledgeEngine:
         self._embedder_probe_cache = (cfg_hash, available, error, now)
         if not available:
             logger.warning(f"Active embedder probe failed ({model}): {error}")
-        return {"available": available, "error": error, "model": model}
+        return {
+            "available": available,
+            "error": error,
+            "model": model,
+            "state": "available" if available else "unavailable",
+        }
 
     async def health(self, collection: str | None = None) -> dict[str, Any]:
         _emb = await self.probe_active_embedder()
@@ -4066,6 +4452,7 @@ class KnowledgeEngine:
             "embedder_available": _emb["available"],
             "embedder_error": _emb["error"],
             "embedder_model": _emb["model"],
+            "embedder_state": _emb.get("state"),
             "reindex_in_progress": list(self._reindex_in_progress),
             "stale": False,
             "reindex_deferred": False,

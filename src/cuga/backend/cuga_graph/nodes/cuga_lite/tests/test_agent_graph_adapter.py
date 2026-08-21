@@ -182,7 +182,8 @@ def test_normalize_response_extracts_reasoning():
 # ── 6. on_response_processed hook ────────────────────────────────────────
 
 
-def test_on_response_processed_calls_tracker_for_code():
+@pytest.mark.unit
+def test_on_response_processed_code_branch_records_fenced_code_not_content():
     AgentGraphAdapter = _get_adapter_class()
     tracker = _make_tracker()
     adapter = AgentGraphAdapter(
@@ -193,11 +194,20 @@ def test_on_response_processed_calls_tracker_for_code():
         base_tool_provider=None,
     )
     state = SimpleNamespace()
-    adapter.on_response_processed(state, code="print(1)", content="```python\nprint(1)\n```")
-    tracker.collect_step.assert_called()
+    content = "Here is the solution:\n```python\nprint(1)\n```"
+    code = "print(1)"
+    adapter.on_response_processed(state, code=code, content=content, reasoning=None)
+
+    calls = tracker.collect_step.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["step"].name == "Raw_Assistant_Response"
+    assert calls[0].kwargs["step"].data == content
+    assert calls[1].kwargs["step"].name == "Assistant_code"
+    assert calls[1].kwargs["step"].data == "```python\nprint(1)\n```"
 
 
-def test_on_response_processed_calls_tracker_for_nl():
+@pytest.mark.unit
+def test_on_response_processed_records_reasoning_before_assistant_step():
     AgentGraphAdapter = _get_adapter_class()
     tracker = _make_tracker()
     adapter = AgentGraphAdapter(
@@ -208,8 +218,46 @@ def test_on_response_processed_calls_tracker_for_nl():
         base_tool_provider=None,
     )
     state = SimpleNamespace()
-    adapter.on_response_processed(state, code=None, content="The answer is 42.")
-    tracker.collect_step.assert_called()
+    content = "The answer is 42."
+    reasoning = "I computed six times seven."
+
+    adapter.on_response_processed(
+        state,
+        code=None,
+        content=content,
+        reasoning=reasoning,
+    )
+
+    calls = tracker.collect_step.call_args_list
+    assert [call.kwargs["step"].name for call in calls] == [
+        "Raw_Assistant_Response",
+        "Assistant_reasoning",
+        "Assistant_nl",
+    ]
+    assert calls[1].kwargs["step"].data == reasoning
+
+
+@pytest.mark.unit
+def test_on_response_processed_nl_branch_records_content():
+    AgentGraphAdapter = _get_adapter_class()
+    tracker = _make_tracker()
+    adapter = AgentGraphAdapter(
+        tracker=tracker,
+        base_callbacks=[],
+        task_todos_ref=[],
+        tools_context_ref={},
+        base_tool_provider=None,
+    )
+    state = SimpleNamespace()
+    content = "The answer is 42."
+    adapter.on_response_processed(state, code=None, content=content, reasoning="")
+
+    calls = tracker.collect_step.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["step"].name == "Raw_Assistant_Response"
+    assert calls[0].kwargs["step"].data == content
+    assert calls[1].kwargs["step"].name == "Assistant_nl"
+    assert calls[1].kwargs["step"].data == content
 
 
 # ── 7. build_metadata_update hook ────────────────────────────────────────
@@ -233,31 +281,90 @@ def test_build_metadata_update_adds_playbook_flag_when_fired():
 # ── 8. classify_auto_continue hook ───────────────────────────────────────
 
 
+def _decision(auto_continue: bool, blocked_override: bool = False):
+    from cuga.backend.cuga_graph.nodes.cuga_lite.nl_auto_continue_classifier import (
+        AutoContinueDecision,
+    )
+
+    return AutoContinueDecision(auto_continue=auto_continue, blocked_override=blocked_override)
+
+
 @pytest.mark.asyncio
 async def test_classify_auto_continue_delegates_to_nl_classifier():
     adapter = _make_adapter()
-    state = SimpleNamespace()
+    state = SimpleNamespace(chat_messages=[], cuga_lite_metadata={})
     mock_model = MagicMock()
 
     with patch(
-        "cuga.backend.cuga_graph.nodes.cuga_lite.adapter.graph_adapter.classify_nl_auto_continue",
+        "cuga.backend.cuga_graph.nodes.cuga_lite.adapter.graph_adapter.classify_nl_auto_continue_decision",
         new_callable=AsyncMock,
-        return_value=True,
+        return_value=_decision(True),
     ) as mock_classify:
         result = await adapter.classify_auto_continue(state, mock_model, "Let me continue.", "thought")
-        mock_classify.assert_called_once_with(mock_model, "Let me continue.", "thought")
+        assert mock_classify.call_count == 1
+        args, kwargs = mock_classify.call_args
+        assert args == (mock_model, "Let me continue.", "thought")
+        assert "evidence" in kwargs
         assert result is True
+
+
+@pytest.mark.asyncio
+async def test_classify_auto_continue_blocked_override_returns_correction_and_marks_retry():
+    """The unverified-blocker retry (issue #610): a blocked_override decision
+    yields the corrective directive string and spends the one-shot marker."""
+    from cuga.backend.cuga_graph.nodes.cuga_lite.nl_auto_continue_classifier import (
+        BLOCKED_CLAIM_CORRECTION,
+    )
+
+    adapter = _make_adapter()
+    adapter._tools_context = {"find_tools": object()}
+    state = SimpleNamespace(chat_messages=[], cuga_lite_metadata={})
+
+    with patch(
+        "cuga.backend.cuga_graph.nodes.cuga_lite.adapter.graph_adapter.classify_nl_auto_continue_decision",
+        new_callable=AsyncMock,
+        return_value=_decision(True, blocked_override=True),
+    ):
+        result = await adapter.classify_auto_continue(
+            state, None, "I'm unable to access the Amazon tools in this session.", None
+        )
+    assert result == BLOCKED_CLAIM_CORRECTION
+    assert state.cuga_lite_metadata["_blocked_claim_retry"] is True
+
+
+@pytest.mark.asyncio
+async def test_classify_auto_continue_evidence_reflects_state():
+    """Evidence must report executed code (Execution output: message) and a
+    spent retry marker so the classifier can refuse a second override."""
+    adapter = _make_adapter()
+    adapter._tools_context = {"find_tools": object()}
+    state = SimpleNamespace(
+        chat_messages=[HumanMessage(content="Execution output:\nsome result")],
+        cuga_lite_metadata={"_blocked_claim_retry": True},
+    )
+
+    with patch(
+        "cuga.backend.cuga_graph.nodes.cuga_lite.adapter.graph_adapter.classify_nl_auto_continue_decision",
+        new_callable=AsyncMock,
+        return_value=_decision(False),
+    ) as mock_classify:
+        result = await adapter.classify_auto_continue(state, None, "text", None)
+    assert result is False
+    evidence = mock_classify.call_args.kwargs["evidence"]
+    assert evidence.tools_available is True
+    assert evidence.code_executed is True
+    assert evidence.retry_used is True
 
 
 @pytest.mark.asyncio
 async def test_classify_auto_continue_returns_false_when_not_continuing():
     adapter = _make_adapter()
-    state = SimpleNamespace()
+    state = SimpleNamespace(chat_messages=[], cuga_lite_metadata={})
 
     with patch(
-        "cuga.backend.cuga_graph.nodes.cuga_lite.adapter.graph_adapter.classify_nl_auto_continue",
+        "cuga.backend.cuga_graph.nodes.cuga_lite.adapter.graph_adapter.classify_nl_auto_continue_decision",
         new_callable=AsyncMock,
-        return_value=False,
+        return_value=_decision(False),
     ):
         result = await adapter.classify_auto_continue(state, None, "All done.", None)
         assert result is False
@@ -282,6 +389,40 @@ def test_prepare_system_content_appends_todos_ref_when_present():
     assert len(result) > len("You are an agent.")
 
 
+def test_prepare_system_content_appends_observed_tool_shapes_when_present():
+    adapter = _make_adapter(task_todos_ref=[])
+    adapter._observed_tool_shapes = {"file_readfile": "list of 3 items"}
+    state = SimpleNamespace(task_todos=None)
+    result = adapter.prepare_system_content(state, {}, "You are an agent.")
+    assert result.startswith("You are an agent.")
+    assert "file_readfile" in result
+    assert "list of 3 items" in result
+
+
+def test_prepare_system_content_omits_observed_shapes_block_when_empty():
+    adapter = _make_adapter(task_todos_ref=[])
+    state = SimpleNamespace(task_todos=None)
+    result = adapter.prepare_system_content(state, {}, "You are an agent.")
+    assert result == "You are an agent."
+
+
+def test_prepare_system_content_combines_todos_and_observed_shapes():
+    todos = [{"title": "Step 1", "status": "pending"}]
+    adapter = _make_adapter(task_todos_ref=todos)
+    adapter._observed_tool_shapes = {"file_readfile": "list of 3 items"}
+    state = SimpleNamespace(task_todos=None)
+    result = adapter.prepare_system_content(state, {}, "You are an agent.")
+    assert "file_readfile" in result
+    assert "list of 3 items" in result
+    assert result.startswith("You are an agent.")
+
+
+def test_new_adapter_has_empty_weak_schema_state_by_default():
+    adapter = _make_adapter()
+    assert adapter._weak_schema_tool_names == frozenset()
+    assert adapter._observed_tool_shapes == {}
+
+
 def test_resolve_max_steps_uses_override_when_given():
     adapter = _make_adapter()
     state = SimpleNamespace(cuga_lite_max_steps=None)
@@ -292,3 +433,25 @@ def test_resolve_max_steps_uses_state_when_set():
     adapter = _make_adapter()
     state = SimpleNamespace(cuga_lite_max_steps=25)
     assert adapter.resolve_max_steps(state, None) == 25
+
+
+# ── 10. get_tools_needing_probing hook ──────────────────────────────────────
+
+
+def test_get_tools_needing_probing_returns_unobserved_weak_schema_tools():
+    adapter = _make_adapter()
+    adapter._weak_schema_tool_names = frozenset({"file_readfile", "get_browser_state"})
+    adapter._observed_tool_shapes = {"file_readfile": "list of 3 items"}
+    assert adapter.get_tools_needing_probing() == frozenset({"get_browser_state"})
+
+
+def test_get_tools_needing_probing_empty_when_all_observed():
+    adapter = _make_adapter()
+    adapter._weak_schema_tool_names = frozenset({"file_readfile"})
+    adapter._observed_tool_shapes = {"file_readfile": "list of 3 items"}
+    assert adapter.get_tools_needing_probing() == frozenset()
+
+
+def test_get_tools_needing_probing_empty_by_default():
+    adapter = _make_adapter()
+    assert adapter.get_tools_needing_probing() == frozenset()

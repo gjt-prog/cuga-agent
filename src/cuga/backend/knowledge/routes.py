@@ -25,11 +25,13 @@ from cuga.backend.knowledge.engine import (
     DocumentExistsError,
     DocumentNotFoundError,
     FileTooLargeError,
+    IngestStillFinishingError,
     IngestionQueueFullError,
     KnowledgeEngine,
     ReindexBusyError,
     ReindexInProgressError,
 )
+from cuga.backend.knowledge.sources import annotate_envelope_with_citations, citations_enabled_for
 
 logger = logging.getLogger("cuga.knowledge")
 
@@ -56,6 +58,41 @@ def _ensure_enabled(engine: KnowledgeEngine) -> None:
     """Raise 503 if knowledge is disabled. Only for mutation endpoints."""
     if not engine._config.enabled:
         raise HTTPException(status_code=503, detail="Knowledge engine is disabled")
+
+
+async def _json_body(request: Request, *, allow_empty: bool = False) -> dict[str, Any]:
+    """Parse a JSON object body, or raise 400.
+
+    ``await request.json()`` raises ``JSONDecodeError`` on an absent or
+    malformed body, and an unhandled raise here escapes as a 500 with a full
+    traceback — the wrong contract for bad client input, and noise that buries
+    real failures in error monitoring (#689).
+
+    ``allow_empty`` accepts a request with **no body at all** and yields
+    ``{}``, for endpoints where every field is optional. It deliberately does
+    not extend to whitespace-only content: that is a malformed body, not an
+    absent one, so it still falls through to parsing and 400s.
+
+    The detail string is the one ``patch_session_settings`` already returned,
+    so this changes status codes only — no shipped message moves under a
+    client that might match on it.
+    """
+    detail = "request body must be a JSON object"
+    raw = await request.body()
+    if not raw:
+        if allow_empty:
+            return {}
+        raise HTTPException(status_code=400, detail=detail)
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        # Only decoding failures become a 400. Anything else (a disconnect
+        # mid-read, for one) is not the client sending bad JSON and must
+        # propagate rather than be reported as a malformed request.
+        raise HTTPException(status_code=400, detail=detail)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail=detail)
+    return body
 
 
 def _extract_task_error(task: dict[str, Any], fallback: str = "Ingestion failed") -> str:
@@ -237,6 +274,10 @@ async def health(request: Request):
         "embedder_available": h.get("embedder_available"),
         "embedder_error": h.get("embedder_error"),
         "embedder_model": h.get("embedder_model"),
+        # "disabled" | "preparing" | "available" | "unavailable". Lets the UI
+        # distinguish a cold start still downloading its model from a genuine
+        # fault, instead of showing a red error for both.
+        "embedder_state": h.get("embedder_state"),
     }
     if collection:
         result["stale"] = h.get("stale", False)
@@ -257,7 +298,7 @@ async def get_settings(request: Request):
 @knowledge_agent_manage_router.post("/settings")
 async def update_settings(request: Request):
     engine = _get_engine(request)
-    body = await request.json()
+    body = await _json_body(request)
     knowledge_settings = body.get("knowledge", body)
     try:
         return engine.update_settings(**knowledge_settings)
@@ -305,7 +346,7 @@ async def search(
 
     engine = _get_engine(request)
     _ensure_enabled(engine)
-    body = await request.json()
+    body = await _json_body(request)
     scope = body.get("scope", "agent")
     query = body.get("query", "")
     limit = body.get("limit", engine._config.default_limit)
@@ -356,6 +397,8 @@ async def search(
             fallback_from=fallback_from,
             include_scores=include_scores,
         )
+        if citations_enabled_for(engine._config, identity.thread_id):
+            annotate_envelope_with_citations(env, results, thread_id=identity.thread_id, query=query)
         _emit_canonical_log(
             tid_preview=_tid_preview,
             query_preview=_query_preview,
@@ -416,6 +459,8 @@ async def search(
         fallback_from=None,
         include_scores=include_scores,
     )
+    if citations_enabled_for(engine._config, identity.thread_id):
+        annotate_envelope_with_citations(env, results, thread_id=identity.thread_id, query=query)
     _emit_canonical_log(
         tid_preview=_tid_preview,
         query_preview=_query_preview,
@@ -575,6 +620,18 @@ async def upload_documents(
         except ReindexInProgressError:
             tmp_path.unlink(missing_ok=True)
             raise HTTPException(status_code=409, detail="Reindex in progress, try again later")
+        except DocumentExistsError as e:
+            # The ATOMIC layer (``_create_task_entry_internal``, under the
+            # collection lock) can reject where the advisory pre-check above
+            # passed — two uploads of the same file racing that window. It is
+            # the same 409 the pre-check raises, not a 500. Cancel makes this
+            # more reachable: a cancel can land between the two checks.
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=409, detail=f"file already indexed: {e.filename}")
+        except Exception:
+            # Anything else still must not leak the temp file on disk.
+            tmp_path.unlink(missing_ok=True)
+            raise
 
         if wait:
             try:
@@ -641,7 +698,7 @@ async def ingest_url(
 ):
     engine = _get_engine(request)
     _ensure_enabled(engine)
-    body = await request.json()
+    body = await _json_body(request)
     scope = body.get("scope", "agent")
     ensure_agent_scope_manage_if_needed(identity, scope)
     collection = resolve_collection(identity, scope, request)
@@ -718,11 +775,17 @@ async def get_document_file(
         raise HTTPException(status_code=404, detail="document not found")
 
     media_type, _ = mimetypes.guess_type(str(file_path))
+    # Let Starlette build Content-Disposition. It RFC 5987-encodes non-ASCII
+    # filenames (Hebrew, Arabic, CJK, emoji…) as ``filename*=utf-8''…``, which
+    # is latin-1-safe — hand-rolling ``filename="<raw>"`` crashed on any name
+    # outside latin-1 (Starlette encodes all header values as latin-1).
+    # content_disposition_type="inline" so the browser opens the doc (e.g. a
+    # PDF preview) instead of forcing a download.
     return FileResponse(
         file_path,
         filename=file_path.name,
         media_type=media_type or "application/octet-stream",
-        headers={"Content-Disposition": f'inline; filename="{file_path.name}"'},
+        content_disposition_type="inline",
     )
 
 
@@ -733,7 +796,7 @@ async def delete_document(
 ):
     engine = _get_engine(request)
     _ensure_enabled(engine)
-    body = await request.json()
+    body = await _json_body(request)
     scope = body.get("scope", "agent")
     ensure_agent_scope_manage_if_needed(identity, scope)
     filename = body.get("filename", "")
@@ -746,6 +809,10 @@ async def delete_document(
         return {"status": "ok"}
     except DocumentNotFoundError:
         raise HTTPException(status_code=404, detail="document not found")
+    except IngestStillFinishingError as e:
+        # Retryable: the ingest is past its point of no return and still has an
+        # add_document ahead of it, so a "deleted" answer here would be undone.
+        raise HTTPException(status_code=409, detail=str(e))
     except ReindexInProgressError:
         # Delete is rejected while this collection is being reindexed —
         # otherwise the doc would be re-embedded into the in-flight target and
@@ -779,6 +846,75 @@ async def delete_session_collection(
     return {"status": "ok"}
 
 
+# --- Session settings ---
+
+_SESSION_SETTINGS_ALLOWED = {"citations_enabled"}
+
+
+def _coerce_flag(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+def _resolve_session_provider(request: Request, identity: KnowledgeIdentity):
+    """Resolve the knowledge provider and enforce session ownership.
+
+    Raises 503 if the provider is not initialized, and 403 if the caller
+    (when user_id/tenant_id are present) does not own the session. Same
+    ownership pattern as resolve_collection for scope=session.
+    """
+    app_state = getattr(request.app.state, "app_state", None)
+    provider = getattr(app_state, "knowledge_provider", None) if app_state else None
+    if provider is None:
+        raise HTTPException(status_code=503, detail="knowledge not initialized")
+    if provider and identity.user_id and identity.tenant_id:
+        if not provider.check_session_access(identity.thread_id, identity.user_id, identity.tenant_id):
+            raise HTTPException(status_code=403, detail="access denied to session")
+    return provider
+
+
+def _apply_session_settings_patch(provider, thread_id: str, body: dict, *, user_id: str, tenant_id: str):
+    patch = {k: _coerce_flag(v) for k, v in (body or {}).items() if k in _SESSION_SETTINGS_ALLOWED}
+    if not patch:
+        raise ValueError(f"no valid session settings in patch; allowed: {sorted(_SESSION_SETTINGS_ALLOWED)}")
+    return provider.patch_session_overrides(thread_id, patch, user_id=user_id, tenant_id=tenant_id)
+
+
+@knowledge_router.get("/session/settings")
+async def get_session_settings(
+    request: Request, identity: KnowledgeIdentity = Depends(require_internal_or_auth)
+):
+    """Per-conversation knowledge settings overrides (citations toggle)."""
+    if not identity.thread_id:
+        raise HTTPException(status_code=400, detail="X-Thread-ID header required")
+    provider = _resolve_session_provider(request, identity)
+    session = provider.get_session(identity.thread_id)
+    return {"thread_id": identity.thread_id, "overrides": (session.overrides if session else {})}
+
+
+@knowledge_router.patch("/session/settings")
+async def patch_session_settings(
+    request: Request, identity: KnowledgeIdentity = Depends(require_internal_or_auth)
+):
+    """Update per-conversation knowledge settings overrides (citations toggle)."""
+    if not identity.thread_id:
+        raise HTTPException(status_code=400, detail="X-Thread-ID header required")
+    provider = _resolve_session_provider(request, identity)
+    body = await _json_body(request)
+    try:
+        state = _apply_session_settings_patch(
+            provider,
+            identity.thread_id,
+            body,
+            user_id=identity.user_id or "",
+            tenant_id=identity.tenant_id or "",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"thread_id": identity.thread_id, "overrides": state.overrides}
+
+
 # --- Reindex ---
 
 
@@ -789,7 +925,7 @@ async def reindex_collection(
 ):
     engine = _get_engine(request)
     _ensure_enabled(engine)
-    body = await request.json() if request.headers.get("content-length", "0") != "0" else {}
+    body = await _json_body(request, allow_empty=True)
     scope = body.get("scope", "agent")
     ensure_agent_scope_manage_if_needed(identity, scope)
     collection = resolve_collection(identity, scope, request)

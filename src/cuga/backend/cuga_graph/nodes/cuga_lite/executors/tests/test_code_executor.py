@@ -164,6 +164,99 @@ async def test_undefined_variable_keeps_bare_name_error(mock_state):
     assert "tool-name correction" not in result
 
 
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_stdout_preserved_when_later_line_raises(mock_state):
+    """Stdout from earlier successful lines must survive a later exception.
+
+    Regression for #547: find_tools discovery was printed in the same script as
+    a subsequent NameError, but LocalExecutor only read the redirect buffer
+    after a successful return — so the agent never saw the real tool names.
+    """
+
+    async def find_tools(intent: str, app: str = "") -> str:
+        return f"## tools for {app}\n- gmail_send_email_emails_post"
+
+    async def gmail_list_emails_emails_get() -> list:
+        return []
+
+    code = (
+        "listed = gmail_list_emails_emails_get\n"
+        "tools_output = await find_tools('send email with attachment', 'gmail')\n"
+        "print(tools_output)\n"
+        "print(undefined_after_discovery)"
+    )
+    result, _ = await CodeExecutor.eval_with_tools_async(
+        code=code,
+        _locals={
+            'find_tools': find_tools,
+            'gmail_list_emails_emails_get': gmail_list_emails_emails_get,
+        },
+        state=mock_state,
+        mode='local',
+    )
+
+    assert "gmail_send_email_emails_post" in result
+    assert "Error during execution" in result
+    assert "undefined_after_discovery" in result
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_assignment_rhs_fabricated_tool_gets_correction(mock_state):
+    """Assignment-shaped fabricated tool names must get difflib correction.
+
+    Regression for #547: `send_email = gmail_send_message_send_message_post`
+    is a common alias pattern, but `_missing_name_usage` only treated Call
+    nodes as fabricated tools, so the hint was suppressed for assignment RHS.
+    """
+
+    async def gmail_send_email_emails_post(**kwargs) -> dict:
+        return {}
+
+    async def gmail_list_emails_emails_get() -> list:
+        return []
+
+    code = (
+        "listed = gmail_list_emails_emails_get\n"
+        "send_email = gmail_send_message_send_message_post\n"
+        "print(send_email)"
+    )
+    result, _ = await CodeExecutor.eval_with_tools_async(
+        code=code,
+        _locals={
+            'gmail_send_email_emails_post': gmail_send_email_emails_post,
+            'gmail_list_emails_emails_get': gmail_list_emails_emails_get,
+        },
+        state=mock_state,
+        mode='local',
+    )
+
+    assert "tool-name correction" in result
+    assert "Did you mean" in result
+    assert "gmail_send_email_emails_post" in result
+
+
+@pytest.mark.unit
+def test_missing_name_usage_detects_assignment_rhs():
+    """AST helper marks assignment-RHS references as tool-shaped usage."""
+    from cuga.backend.cuga_graph.nodes.cuga_lite.executors.local.local_executor import LocalExecutor
+
+    used, defined = LocalExecutor._missing_name_usage(
+        'gmail_send_message_send_message_post',
+        'send_email = gmail_send_message_send_message_post',
+    )
+    assert used is True
+    assert defined is False
+
+    used, defined = LocalExecutor._missing_name_usage(
+        'formatted_total',
+        'print(formatted_total)',
+    )
+    assert used is False
+    assert defined is False
+
+
 def test_correction_cutoff_rejects_cross_app_junk():
     """Weak cross-app matches must not be offered as suggestions.
 
@@ -468,3 +561,49 @@ async def test_mode_auto_detection(mock_state):
 
     assert 'x' in new_vars
     assert new_vars['x'] == 42
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_generated_exit_ends_the_block_not_the_runtime(mock_state):
+    """exit() ends the block early and keeps its variables — it must not escape.
+
+    Relaxed execution hands generated code the full builtins dict, so `exit`,
+    `quit` and `SystemExit` are all in scope. SystemExit is a BaseException, so
+    it used to walk past every `except Exception` above the executor and
+    terminate the host process (an evaluation sweep died at task 23 of 40 this
+    way). Stopping the block early is legitimate intent, so it is honoured:
+    stdout and the variables computed before the exit survive, exactly as they
+    would for a block that ended normally.
+    """
+    # CodeExecutor sets the relaxed flag itself from the run's state, so ask for
+    # it there rather than via set_skills_relaxed_execution (which it overwrites).
+    mock_state.reflection_skills_enabled = True
+
+    result, new_vars = await CodeExecutor.eval_with_tools_async(
+        code=(
+            "cart_total = 299.0\n"
+            "partner_email = None\n"
+            "print('computed the total')\n"
+            "if not partner_email:\n"
+            "    exit()\n"
+            "unreachable_var = True"
+        ),
+        _locals={},
+        state=mock_state,
+        mode='local',
+    )
+    assert "ended early" in result
+    assert "computed the total" in result
+    # work done before the exit is kept, so the next block can build on it
+    assert new_vars.get('cart_total') == 299.0
+    assert 'unreachable_var' not in new_vars
+
+    # an explicit reason is surfaced to the agent rather than swallowed
+    result, _ = await CodeExecutor.eval_with_tools_async(
+        code="raise SystemExit('no candidate found')",
+        _locals={},
+        state=mock_state,
+        mode='local',
+    )
+    assert "no candidate found" in result

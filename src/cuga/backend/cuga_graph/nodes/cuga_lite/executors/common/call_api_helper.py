@@ -60,8 +60,14 @@ class CallApiHelper:
                 args: Arguments to pass to the API
                 operation_id: Optional original OpenAPI operationId for tracking
             """
+            from cuga.backend.cuga_graph.nodes.cuga_lite.tracking.tracker import BlockToolCallCounter
+
+            BlockToolCallCounter.increment()
+
             if args is None:
                 args = {}
+
+            ToolCallTracker.enforce_call_budget()
 
             timeout_seconds = getattr(settings.advanced_features, 'tool_call_timeout', 30)
             start_time = time.time()

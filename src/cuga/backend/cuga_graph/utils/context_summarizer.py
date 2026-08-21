@@ -325,8 +325,27 @@ class ContextSummarizer:
             return new_messages, summary_metrics
 
         except Exception as e:
+            # Hard truncation is the maximal state-loss mode (dropped IDs, variables,
+            # partial results) — signal it loudly with counts, and return metrics rich
+            # enough for the tracker/eval analysis to find affected tasks (issue #563).
+            # keep_n <= 0 must keep nothing: messages[-0:] would return the WHOLE list.
+            kept_messages = messages[-keep_n:] if keep_n > 0 else []
+            dropped = len(messages) - len(kept_messages)
             logger.exception(f"Failed to summarize messages: {e}")
-            return messages[-keep_n:], {"error": str(e), "fallback": "kept recent messages only"}
+            logger.error(
+                f"🚨 Context summarization FAILED — hard truncation applied: dropped {dropped} "
+                f"of {before_metrics['message_count']} messages (~{before_metrics['token_count']} "
+                f"tokens before), kept last {len(kept_messages)} only. State loss is likely."
+            )
+            return kept_messages, {
+                "error": str(e),
+                "fallback": "kept recent messages only",
+                "hard_truncation": True,
+                "messages_dropped": dropped,
+                "messages_kept": len(kept_messages),
+                "message_count_before": before_metrics["message_count"],
+                "token_count_before": before_metrics["token_count"],
+            }
 
     def _sanitize_content(self, content: Any) -> str:
         """
@@ -391,6 +410,31 @@ class ContextSummarizer:
 
         NOTE: This uses LangChain internal APIs (AgentState, Runtime) which may change
         in future versions. Integration tests should catch breaking changes.
+
+        Why pyproject.toml pins ``langchain<1.3.15``:
+
+        This only matters when the summary model call itself fails. Measured with 30 messages
+        and ``keep_last_n_messages = 10``:
+
+        - 1.3.9-1.3.14 catch the failure inside the middleware and return the text
+          "Error generating summary: ...". We treat that like any other summary, so we get
+          back 11 messages (that placeholder plus the last 10) and metrics that report a
+          successful summarization.
+        - 1.3.15 retries the call and, if it still fails, lets the exception out.
+          ``_invoke_middleware`` wraps it as ``RuntimeError("middleware_invocation_failed:
+          <original error>")``, which the ``except`` in ``summarize_messages`` catches. We get
+          back 10 messages (the last 10, no placeholder), an error log, and metrics carrying
+          ``hard_truncation``.
+
+        Both versions lose the same 20 older messages, so this is not a difference in how much
+        history survives. What differs is the extra placeholder message and, more usefully, the
+        reporting: 1.3.15 retries first and says the summarization failed, whereas 1.3.9-1.3.14
+        pass an error string off as a summary and report success.
+
+        The cap exists only so that a dependency bump made for security reasons does not also
+        change behaviour. It is not a judgement that 1.3.15 is worse — on retries and honest
+        metrics it is better. Lift it whenever the shorter return and the ``hard_truncation``
+        metrics are acceptable to the tracker/eval consumers (see issue #563).
 
         Args:
             typed_messages: List of typed messages for middleware

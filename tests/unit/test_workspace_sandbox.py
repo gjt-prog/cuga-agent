@@ -1,6 +1,5 @@
 import pytest
 
-from cuga.backend.cuga_graph.nodes.cuga_lite.executors.native import native_sandbox_executor
 from cuga.backend.server.workspace_sandbox import (
     NATIVE_DISPLAY_ROOT,
     NATIVE_WORKSPACE_ROOT,
@@ -13,56 +12,99 @@ from cuga.backend.server.workspace_sandbox import (
 )
 
 
+def _settings(
+    *,
+    opensandbox_sandbox: bool,
+    sandbox_mode: str,
+    enable_shell_tool: bool = False,
+    enable_filesystem_tools: bool = False,
+):
+    class Adv:
+        pass
+
+    adv = Adv()
+    adv.opensandbox_sandbox = opensandbox_sandbox
+    adv.sandbox_mode = sandbox_mode
+    adv.enable_shell_tool = enable_shell_tool
+    adv.enable_filesystem_tools = enable_filesystem_tools
+
+    class Settings:
+        advanced_features = adv
+        execution = type(
+            "Exec",
+            (),
+            {
+                "shell_backend": None,
+                "filesystem_backend": None,
+                "python_backend": None,
+                "workspace_root": None,
+            },
+        )()
+
+    return Settings()
+
+
+@pytest.mark.unit
 def test_workspace_tree_is_native_backed_when_host_shell_with_opensandbox_flag(monkeypatch) -> None:
     from cuga.backend.server import workspace_sandbox as ws
 
-    class Adv:
-        opensandbox_sandbox = True
-        enable_shell_tool = True
-        sandbox_mode = "native"
-        enable_filesystem_tools = True
-
-    class Settings:
-        advanced_features = Adv()
-        execution = type(
-            "Exec",
-            (),
-            {
-                "shell_backend": None,
-                "filesystem_backend": None,
-                "python_backend": None,
-                "workspace_root": None,
-            },
-        )()
-
-    monkeypatch.setattr(ws, "settings", Settings())
+    monkeypatch.setattr(
+        ws,
+        "settings",
+        _settings(
+            opensandbox_sandbox=True,
+            enable_shell_tool=True,
+            sandbox_mode="native",
+            enable_filesystem_tools=True,
+        ),
+    )
     assert ws.workspace_tree_is_native_backed() is True
+    assert ws.workspace_tree_is_sandbox_backed() is False
 
 
+@pytest.mark.unit
 def test_workspace_tree_is_not_native_when_opensandbox_shell_only(monkeypatch) -> None:
     from cuga.backend.server import workspace_sandbox as ws
 
-    class Adv:
-        opensandbox_sandbox = True
-        enable_shell_tool = True
-        sandbox_mode = "opensandbox"
-        enable_filesystem_tools = True
-
-    class Settings:
-        advanced_features = Adv()
-        execution = type(
-            "Exec",
-            (),
-            {
-                "shell_backend": None,
-                "filesystem_backend": None,
-                "python_backend": None,
-                "workspace_root": None,
-            },
-        )()
-
-    monkeypatch.setattr(ws, "settings", Settings())
+    monkeypatch.setattr(
+        ws,
+        "settings",
+        _settings(
+            opensandbox_sandbox=True,
+            enable_shell_tool=True,
+            sandbox_mode="opensandbox",
+            enable_filesystem_tools=True,
+        ),
+    )
     assert ws.workspace_tree_is_native_backed() is False
+    assert ws.workspace_tree_is_sandbox_backed() is True
+
+
+@pytest.mark.unit
+def test_workspace_tree_uses_native_when_sandbox_mode_native_without_shell_tools(monkeypatch) -> None:
+    """Default-ish settings: opensandbox_sandbox=true, sandbox_mode=native, shell tools off."""
+    from cuga.backend.server import workspace_sandbox as ws
+
+    monkeypatch.setattr(
+        ws,
+        "settings",
+        _settings(opensandbox_sandbox=True, sandbox_mode="native"),
+    )
+    assert ws.workspace_tree_is_native_backed() is True
+    assert ws.workspace_tree_is_sandbox_backed() is False
+
+
+@pytest.mark.unit
+def test_workspace_tree_uses_native_when_sandbox_mode_local_with_opensandbox_flag(monkeypatch) -> None:
+    from cuga.backend.server import workspace_sandbox as ws
+
+    monkeypatch.setattr(
+        ws,
+        "settings",
+        _settings(opensandbox_sandbox=True, sandbox_mode="local"),
+    )
+    assert ws.workspace_tree_is_native_backed() is True
+    assert ws.workspace_tree_is_sandbox_backed() is False
 
 
 def test_sandbox_workspace_root() -> None:
@@ -163,10 +205,12 @@ def test_sandbox_paths_to_tree_can_render_native_workspace_public_paths() -> Non
 
 
 def test_fetch_native_workspace_tree_is_per_thread_and_public_workspace(monkeypatch, tmp_path) -> None:
+    from cuga.backend.server import workspace_sandbox as ws
+
     def fake_workspace_root(thread_id: str | None):
         return tmp_path / (thread_id or "_default") / "workspace"
 
-    monkeypatch.setattr(native_sandbox_executor, "native_thread_workspace_root", fake_workspace_root)
+    monkeypatch.setattr(ws, "_host_workspace_root", fake_workspace_root)
 
     thread_a_root = fake_workspace_root("thread-a")
     thread_b_root = fake_workspace_root("thread-b")
@@ -196,10 +240,12 @@ def test_fetch_native_workspace_tree_is_per_thread_and_public_workspace(monkeypa
 
 
 def test_native_workspace_file_access_maps_workspace_to_thread_root(monkeypatch, tmp_path) -> None:
+    from cuga.backend.server import workspace_sandbox as ws
+
     def fake_workspace_root(thread_id: str | None):
         return tmp_path / (thread_id or "_default") / "workspace"
 
-    monkeypatch.setattr(native_sandbox_executor, "native_thread_workspace_root", fake_workspace_root)
+    monkeypatch.setattr(ws, "_host_workspace_root", fake_workspace_root)
 
     root = fake_workspace_root("thread-a")
     (root / "nested").mkdir(parents=True)
@@ -228,10 +274,12 @@ def test_native_workspace_file_access_maps_workspace_to_thread_root(monkeypatch,
 def test_native_workspace_file_access_rejects_paths_outside_public_workspace(
     monkeypatch, tmp_path, bad_path: str
 ) -> None:
+    from cuga.backend.server import workspace_sandbox as ws
+
     def fake_workspace_root(thread_id: str | None):
         return tmp_path / (thread_id or "_default") / "workspace"
 
-    monkeypatch.setattr(native_sandbox_executor, "native_thread_workspace_root", fake_workspace_root)
+    monkeypatch.setattr(ws, "_host_workspace_root", fake_workspace_root)
 
     with pytest.raises(ValueError):
         native_workspace_text_preview("thread-a", bad_path)

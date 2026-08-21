@@ -35,6 +35,63 @@ from cuga.config import settings
 _llm_manager = LLMManager()
 
 
+def _describe_observed_shape(result: Any) -> str:
+    """Render a short, human-readable description of an observed tool result."""
+    if isinstance(result, dict):
+        keys = list(result.keys())[:8]
+        suffix = ", ..." if len(result) > len(keys) else ""
+        return f"dict with keys [{', '.join(repr(k) for k in keys)}{suffix}]"
+    if isinstance(result, (list, tuple)):
+        kind = type(result).__name__
+        if result:
+            return (
+                f"{kind} of {len(result)} items, e.g. first item: "
+                f"{type(result[0]).__name__} {str(result[0])[:120]!r}"
+            )
+        return f"empty {kind}"
+    if isinstance(result, str):
+        return f"str of {len(result)} chars, e.g. {result[:120]!r}"
+    return type(result).__name__
+
+
+def _record_weak_schema_shapes(adapter: Any, tool_calls: list) -> None:
+    """Stash the first observed output shape for any weak-schema tool this session."""
+    weak_schema_tool_names = getattr(adapter, "_weak_schema_tool_names", frozenset())
+    if not weak_schema_tool_names:
+        return
+    observed = getattr(adapter, "_observed_tool_shapes", {})
+    for call in tool_calls:
+        name = call.get("name")
+        if name not in weak_schema_tool_names or name in observed or call.get("error"):
+            continue
+        observed[name] = _describe_observed_shape(call.get("result"))
+
+
+def _needs_shape_tracking(adapter: Any) -> bool:
+    """True when at least one weak-schema tool's shape hasn't been observed yet this session."""
+    weak_schema_tool_names = getattr(adapter, "_weak_schema_tool_names", frozenset())
+    observed = getattr(adapter, "_observed_tool_shapes", {})
+    return bool(weak_schema_tool_names - observed.keys())
+
+
+def _budget_updates() -> dict:
+    """The tool-call budget fields every exit from the sandbox must carry.
+
+    Every path out of the node runs *after* the code block, so every one of them
+    can be leaving spent budget behind — including the error and step-limit
+    paths. A path that omits these leaves the keys absent from the state update,
+    and LangGraph then keeps the checkpoint's pre-block values, silently
+    under-counting the conversation ceiling.
+    """
+    from cuga.backend.cuga_graph.nodes.cuga_lite.tracking.tracker import ToolCallTracker
+
+    return {
+        "tool_calls_used_run": ToolCallTracker.get_run_budget_used(),
+        "tool_calls_used_thread": ToolCallTracker.get_thread_budget_used(),
+        "tool_budget_exhausted": ToolCallTracker.budget_exhausted(),
+    }
+
+
 def create_sandbox_node(adapter: Any, base_thread_id: Any, base_apps_list: Any) -> Callable:
     async def sandbox(state: Any, config: Optional[RunnableConfig] = None):
         """Execute code in sandbox and return results."""
@@ -75,8 +132,25 @@ def create_sandbox_node(adapter: Any, base_thread_id: Any, base_apps_list: Any) 
         # Add tools to context
         context = {**existing_vars, **adapter._tools_context}
 
-        # Start tool call tracking (only if enabled via invoke parameter)
-        ToolCallTracker.start_tracking(enabled=track_tool_calls)
+        # Start tool call tracking (enabled via invoke parameter, or internally
+        # whenever a weak-schema tool's output shape hasn't been observed yet).
+        # "timings_only" (set when tracking is forced for the run receipt) records
+        # tool name/duration but never arguments/results/errors — but shape
+        # tracking reads the result payload, so it takes precedence and forces
+        # full recording when a weak-schema shape still needs to be observed.
+        needs_shape = _needs_shape_tracking(adapter)
+        ToolCallTracker.start_tracking(
+            enabled=bool(track_tool_calls) or needs_shape,
+            timings_only=track_tool_calls == "timings_only" and not needs_shape,
+        )
+        # Tool-call budgets: carry the turn count from earlier steps and the
+        # conversation count from earlier turns, so max_tool_calls_per_run caps the run
+        # and max_tool_calls_per_thread caps the thread. The per-block budget is
+        # opened by the executor, once per code block.
+        ToolCallTracker.seed_call_budget(
+            getattr(state, "tool_calls_used_run", 0),
+            getattr(state, "tool_calls_used_thread", 0),
+        )
 
         try:
             # Execute the script - pass the CugaLiteState itself since it has variables_manager
@@ -88,6 +162,7 @@ def create_sandbox_node(adapter: Any, base_thread_id: Any, base_apps_list: Any) 
                     _exec_plan.shell_backend,
                     _exec_plan.filesystem_backend,
                 )
+            logger.debug(f"\n\n------\n\n📝 Generated code:\n\n{state.script}\n\n------\n\n")
             output, new_vars = await CodeExecutor.eval_with_tools_async(
                 code=state.script,
                 _locals=context,
@@ -197,7 +272,10 @@ def create_sandbox_node(adapter: Any, base_thread_id: Any, base_apps_list: Any) 
 
             # Collect tool calls from this execution
             execution_tool_calls = ToolCallTracker.stop_tracking()
-            accumulated_tool_calls = (state.tool_calls or []) + execution_tool_calls
+            _record_weak_schema_shapes(adapter, execution_tool_calls)
+            accumulated_tool_calls = (state.tool_calls or []) + (
+                execution_tool_calls if track_tool_calls else []
+            )
 
             if error_message:
                 return core_create_error_command(
@@ -210,6 +288,12 @@ def create_sandbox_node(adapter: Any, base_thread_id: Any, base_apps_list: Any) 
                         "variable_counter_state": state.variable_counter_state,
                         "variable_creation_order": state.variable_creation_order,
                         "tool_calls": accumulated_tool_calls,
+                        # The block already ran and may have spent budget. Omitting
+                        # these leaves the key absent from the update, so the
+                        # checkpoint keeps its pre-block value and those calls
+                        # vanish from the thread ceiling — keep_highest cannot
+                        # rescue a value that was never written.
+                        **_budget_updates(),
                     },
                 )
 
@@ -221,6 +305,9 @@ def create_sandbox_node(adapter: Any, base_thread_id: Any, base_apps_list: Any) 
                 "variable_creation_order": state.variable_creation_order,
                 "step_count": state.step_count + 1,
                 "tool_calls": accumulated_tool_calls,
+                "tool_calls_used_run": ToolCallTracker.get_run_budget_used(),
+                "tool_calls_used_thread": ToolCallTracker.get_thread_budget_used(),
+                "tool_budget_exhausted": ToolCallTracker.budget_exhausted(),
             }
             if todo_state_update is not None:
                 base_update["task_todos"] = todo_state_update
@@ -228,7 +315,10 @@ def create_sandbox_node(adapter: Any, base_thread_id: Any, base_apps_list: Any) 
         except Exception as e:
             # Collect tool calls even on error
             execution_tool_calls = ToolCallTracker.stop_tracking()
-            accumulated_tool_calls = (state.tool_calls or []) + execution_tool_calls
+            _record_weak_schema_shapes(adapter, execution_tool_calls)
+            accumulated_tool_calls = (state.tool_calls or []) + (
+                execution_tool_calls if track_tool_calls else []
+            )
 
             error_msg = f"Error during execution: {str(e)}"
             logger.error(error_msg)
@@ -239,7 +329,11 @@ def create_sandbox_node(adapter: Any, base_thread_id: Any, base_apps_list: Any) 
 
             if limit_error_message:
                 return core_create_error_command(
-                    adapter, updated_messages, limit_error_message, state.step_count
+                    adapter,
+                    updated_messages,
+                    limit_error_message,
+                    state.step_count,
+                    additional_updates=_budget_updates(),
                 )
 
             return {
@@ -249,6 +343,9 @@ def create_sandbox_node(adapter: Any, base_thread_id: Any, base_apps_list: Any) 
                 "execution_complete": True,
                 "step_count": state.step_count + 1,
                 "tool_calls": accumulated_tool_calls,
+                "tool_calls_used_run": ToolCallTracker.get_run_budget_used(),
+                "tool_calls_used_thread": ToolCallTracker.get_thread_budget_used(),
+                "tool_budget_exhausted": ToolCallTracker.budget_exhausted(),
             }
 
     return sandbox
